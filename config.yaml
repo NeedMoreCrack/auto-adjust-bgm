@@ -1,0 +1,65 @@
+# ============================================================
+# Video BGM Remover 設定檔
+# ============================================================
+
+# 輸入影片。
+# 相對路徑會以此 YAML 所在目錄為基準。
+input: "TestVid.mp4"
+
+# 輸出影片。
+# null = 自動產生：<原檔名>_no_bgm.<副檔名>
+output: null
+
+eluate:
+  # BandIt v2 checkpoint。
+  # 可用：multi / eng / deu / fra / spa / cmn / fao
+  # 日文、混合語言建議 multi。
+  checkpoint: "multi"
+
+  # AI 運算裝置。
+  # null = ELUATE 自動選擇 CUDA > MPS > CPU
+  # WSL/Linux + NVIDIA：cuda
+  # Apple Silicon Mac：mps
+  # Intel Mac：通常 cpu
+  device: null
+
+  # true = 跳過 ELUATE 的影片長度與磁碟空間預檢查。
+  # 一般保持 false。
+  force: false
+
+audio:
+  # Speech 音量倍率。
+  # 1.0 = 100%
+  # 1.2 = 120%
+  # 0.8 = 80%
+  # 允許範圍：0.0 ~ 2.0
+  speech_volume: 1.0
+
+  # SFX 音量倍率。
+  # 允許範圍：0.0 ~ 2.0
+  sfx_volume: 1.0
+
+  # 最終輸出影片的音訊 codec。
+  # 最通用建議：aac
+  codec: "aac"
+
+  # 音訊 bitrate。
+  # AAC 建議 192k / 256k / 320k。
+  # null = 不額外傳 -b:a 給 FFmpeg。
+  bitrate: "256k"
+
+  # Speech + SFX 相加後可能超過 0 dBFS。
+  # true = 使用 FFmpeg alimiter 防止明顯 clipping / 爆音。
+  limiter: true
+
+  # limiter 峰值上限，範圍 0.1 ~ 1.0。
+  # 0.95 = 峰值限制在約 95%。
+  limiter_level: 0.95
+
+processing:
+  # true = 輸出檔已存在時允許覆蓋。
+  overwrite: true
+
+  # true = 保留 ELUATE 產生的 speech / sfx WAV。
+  # false = 處理完成後刪除暫存 stems。
+  keep_stems: false

@@ -5,39 +5,22 @@
 auto_adjust_bgm.py
 
 用途：
-    使用 ELUATE / BandIt v2 移除影片中的背景音樂 BGM，
-    盡可能保留：
-        - 人聲 Speech
-        - 遊戲音效 SFX
-        - 環境音效
+    使用 ELUATE / BandIt v2 將影片音訊分離為 Speech / Music / SFX，
+    固定丟棄 Music，並分別調整 Speech 與 SFX 音量後重新混音，
+    最後將新音訊 mux 回原影片；影像串流不重新編碼。
 
-處理架構：
-    Video
-      ↓
-    FFmpeg
-      ↓
-    ELUATE / BandIt v2
-      ↓
-    Speech / Music / SFX
-      ↓
-    移除 Music
-      ↓
-    Speech + SFX
-      ↓
-    FFmpeg mux
+支援：
+    - Linux / WSL2
+    - macOS（Apple Silicon 可用 MPS；Intel Mac 通常落到 CPU）
 
-特色：
-    - 不使用 MoviePy
-    - 不使用 pydub
-    - 不使用 Demucs
-    - 不重新編碼影像
-    - FFmpeg 缺少時可自動安裝
-    - ELUATE 使用獨立專用 venv
-    - 支援 CUDA / MPS / CPU 狀態檢查
-    - Windows 原生環境主動阻擋，建議使用 WSL2
-    - 避免誤用全域 ELUATE
-    - 使用暫存輸出檔，成功後才覆蓋正式輸出
-    - 保留 ELUATE 原生 Terminal / Rich 進度顯示
+不建議：
+    - Windows 原生：ELUATE 目前使用 Unix-specific Python API，建議改用 WSL2。
+
+設定：
+    - 預設讀取腳本同目錄的 config.yaml（若存在）
+    - 可用 --config 指定其他 YAML
+    - CLI 參數會覆蓋 YAML
+    - YAML 未指定的值會使用程式預設值
 """
 
 from __future__ import annotations
@@ -49,33 +32,50 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 
 # ============================================================
-# 設定
+# Constants / defaults
 # ============================================================
 
 ELUATE_PACKAGE = "eluate"
-
 TOOL_HOME = Path.home() / ".auto_remove_bgm"
 TOOL_VENV = TOOL_HOME / "venv"
-
 ELUATE_HOME = Path.home() / ".eluate"
 ELUATE_MODELS_DIR = ELUATE_HOME / "models"
 
+CHECKPOINTS = {"multi", "eng", "deu", "fra", "spa", "cmn", "fao"}
+DEVICES = {"cuda", "cpu", "mps"}
+
 SUPPORTED_EXTENSIONS = {
-    ".mp4",
-    ".mkv",
-    ".mov",
-    ".avi",
-    ".webm",
-    ".m4v",
-    ".mpeg",
-    ".mpg",
-    ".ts",
-    ".mts",
-    ".m2ts",
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v",
+    ".mpeg", ".mpg", ".ts", ".mts", ".m2ts", ".flv",
+    ".wmv", ".3gp", ".3g2",
+}
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "input": None,
+    "output": None,
+    "eluate": {
+        "checkpoint": "multi",
+        "device": None,
+        "force": False,
+    },
+    "audio": {
+        "speech_volume": 1.0,
+        "sfx_volume": 1.0,
+        "codec": "aac",
+        "bitrate": "256k",
+        "limiter": True,
+        "limiter_level": 0.95,
+    },
+    "processing": {
+        "overwrite": True,
+        "keep_stems": False,
+    },
 }
 
 
@@ -90,10 +90,6 @@ def print_header(title: str) -> None:
     print("=" * 70)
 
 
-def print_error(message: str) -> None:
-    print(f"[ERROR] {message}", file=sys.stderr)
-
-
 def print_info(message: str) -> None:
     print(f"[INFO] {message}")
 
@@ -104,6 +100,10 @@ def print_ok(message: str) -> None:
 
 def print_warn(message: str) -> None:
     print(f"[WARN] {message}")
+
+
+def print_error(message: str) -> None:
+    print(f"[ERROR] {message}", file=sys.stderr)
 
 
 # ============================================================
@@ -125,31 +125,14 @@ def is_macos() -> bool:
 def is_wsl() -> bool:
     if not is_linux():
         return False
-
-    try:
-        release = platform.release().lower()
-        version = platform.version().lower()
-
-        return (
-                "microsoft" in release
-                or "wsl" in release
-                or "microsoft" in version
-        )
-    except Exception:
-        return False
-
-
-def get_machine_arch() -> str:
-    return platform.machine().lower()
+    text = f"{platform.release()} {platform.version()}".lower()
+    return "microsoft" in text or "wsl" in text
 
 
 def show_platform_info() -> None:
     print_info(
-        f"平台：{platform.system()} "
-        f"{platform.release()} "
-        f"({platform.machine()})"
+        f"平台：{platform.system()} {platform.release()} ({platform.machine()})"
     )
-
     print_info(f"Python：{sys.version.split()[0]}")
     print_info(f"Python executable：{sys.executable}")
 
@@ -157,730 +140,435 @@ def show_platform_info() -> None:
         print_ok("偵測到 WSL 環境")
 
     if is_macos():
-        arch = get_machine_arch()
-
-        if arch in ("x86_64", "amd64"):
+        arch = platform.machine().lower()
+        if arch in {"x86_64", "amd64"}:
             print_warn(
-                "偵測到 Intel Mac。"
-                "新版 PyTorch 對 Intel macOS 的官方 binary 支援有限，"
-                "可能只能使用較舊 PyTorch 或 CPU。"
+                "偵測到 Intel Mac；新版 PyTorch 對 Intel macOS 的 binary "
+                "支援有限，通常只能使用 CPU，甚至可能遇到套件版本限制。"
             )
-
-        elif arch in ("arm64", "aarch64"):
+        elif arch in {"arm64", "aarch64"}:
             print_ok("偵測到 Apple Silicon Mac")
 
 
 def validate_platform() -> None:
     if is_windows():
         raise RuntimeError(
-            "目前不建議在 Windows 原生環境執行 ELUATE。\n\n"
-            "原因：ELUATE 使用 Unix-specific Python API，"
-            "Windows 原生可能出現：\n"
-            "ModuleNotFoundError: No module named 'resource'\n\n"
-            "請改用 WSL2 / Ubuntu 執行，例如：\n\n"
-            "  python3 auto_adjust_bgm.py TestVid.mp4 --device cuda"
+            "目前不建議在 Windows 原生環境執行 ELUATE。\n"
+            "ELUATE 目前使用 Unix-specific Python API；請改用 WSL2 / Linux。\n"
+            "例如：python3 auto_adjust_bgm.py --config config.yaml"
         )
 
 
 # ============================================================
-# 權限 / Linux package manager
+# YAML configuration
+# ============================================================
+
+def deep_copy_dict(value: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(value))
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = deep_copy_dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 PyYAML。請先安裝：\n"
+            "  python3 -m pip install -r requirements.txt\n"
+            "或：\n"
+            "  python3 -m pip install PyYAML"
+        ) from exc
+
+    if not path.exists():
+        raise FileNotFoundError(f"找不到 YAML 設定檔：{path}")
+
+    with path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file)
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("YAML 最外層必須是 mapping/object。")
+    return data
+
+
+def resolve_config_file(cli_config: str | None) -> Path | None:
+    if cli_config:
+        return Path(cli_config).expanduser().resolve()
+
+    default_path = Path(__file__).resolve().with_name("config.yaml")
+    if default_path.exists():
+        return default_path
+
+    return None
+
+
+def resolve_path_from_config(value: str | None, config_file: Path | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    if config_file is not None:
+        return str((config_file.parent / path).resolve())
+
+    return str(path.resolve())
+
+
+def number_in_range(name: str, value: Any, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必須是數字，目前為：{value!r}") from exc
+
+    if not minimum <= number <= maximum:
+        raise ValueError(
+            f"{name} 必須介於 {minimum} ~ {maximum}，目前為：{number}"
+        )
+    return number
+
+
+def validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    eluate = config.setdefault("eluate", {})
+    audio = config.setdefault("audio", {})
+    processing = config.setdefault("processing", {})
+
+    checkpoint = eluate.get("checkpoint", "multi")
+    if checkpoint not in CHECKPOINTS:
+        raise ValueError(
+            f"eluate.checkpoint 不合法：{checkpoint}；可用值：{sorted(CHECKPOINTS)}"
+        )
+
+    device = eluate.get("device")
+    if device is not None and device not in DEVICES:
+        raise ValueError(
+            f"eluate.device 不合法：{device}；可用值：{sorted(DEVICES)} 或 null"
+        )
+
+    audio["speech_volume"] = number_in_range(
+        "audio.speech_volume", audio.get("speech_volume", 1.0), 0.0, 2.0
+    )
+    audio["sfx_volume"] = number_in_range(
+        "audio.sfx_volume", audio.get("sfx_volume", 1.0), 0.0, 2.0
+    )
+    audio["limiter_level"] = number_in_range(
+        "audio.limiter_level", audio.get("limiter_level", 0.95), 0.1, 1.0
+    )
+
+    if not isinstance(eluate.get("force", False), bool):
+        raise ValueError("eluate.force 必須是 true / false。")
+    if not isinstance(audio.get("limiter", True), bool):
+        raise ValueError("audio.limiter 必須是 true / false。")
+    if not isinstance(processing.get("overwrite", True), bool):
+        raise ValueError("processing.overwrite 必須是 true / false。")
+    if not isinstance(processing.get("keep_stems", False), bool):
+        raise ValueError("processing.keep_stems 必須是 true / false。")
+
+    codec = str(audio.get("codec", "aac")).strip()
+    if not codec:
+        raise ValueError("audio.codec 不可為空。")
+    audio["codec"] = codec
+
+    bitrate = audio.get("bitrate", "256k")
+    audio["bitrate"] = None if bitrate in (None, "") else str(bitrate).strip()
+
+    return config
+
+
+def build_config(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]:
+    config_file = resolve_config_file(args.config)
+    config = deep_copy_dict(DEFAULT_CONFIG)
+
+    if config_file:
+        print_info(f"讀取 YAML：{config_file}")
+        config = deep_merge(config, load_yaml(config_file))
+    else:
+        print_warn("未找到 config.yaml，使用程式預設值 / CLI 參數。")
+
+    # CLI > YAML > defaults
+    if args.input is not None:
+        config["input"] = args.input
+    if args.output is not None:
+        config["output"] = args.output
+    if args.checkpoint is not None:
+        config["eluate"]["checkpoint"] = args.checkpoint
+    if args.device is not None:
+        config["eluate"]["device"] = args.device
+    if args.force is not None:
+        config["eluate"]["force"] = args.force
+    if args.speech_volume is not None:
+        config["audio"]["speech_volume"] = args.speech_volume
+    if args.sfx_volume is not None:
+        config["audio"]["sfx_volume"] = args.sfx_volume
+    if args.audio_codec is not None:
+        config["audio"]["codec"] = args.audio_codec
+    if args.audio_bitrate is not None:
+        config["audio"]["bitrate"] = args.audio_bitrate
+    if args.limiter is not None:
+        config["audio"]["limiter"] = args.limiter
+    if args.overwrite is not None:
+        config["processing"]["overwrite"] = args.overwrite
+    if args.keep_stems is not None:
+        config["processing"]["keep_stems"] = args.keep_stems
+
+    config["input"] = resolve_path_from_config(config.get("input"), config_file)
+    config["output"] = resolve_path_from_config(config.get("output"), config_file)
+
+    if not config.get("input"):
+        raise ValueError(
+            "沒有指定 input。請在 config.yaml 設定 input，"
+            "或使用 CLI：python3 auto_adjust_bgm.py video.mp4"
+        )
+
+    return validate_config(config), config_file
+
+
+# ============================================================
+# Linux package helpers / FFmpeg
 # ============================================================
 
 def sudo_prefix() -> list[str]:
-    if is_windows():
-        return []
-
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return []
 
     sudo = shutil.which("sudo")
-
     if sudo:
         return [sudo]
 
-    raise RuntimeError(
-        "需要 root 權限，但系統找不到 sudo。"
-    )
+    raise RuntimeError("需要 root 權限，但找不到 sudo。")
 
 
 def detect_linux_package_manager() -> str | None:
-    for manager in (
-            "apt-get",
-            "dnf",
-            "yum",
-            "pacman",
-            "zypper",
-    ):
+    for manager in ("apt-get", "dnf", "yum", "pacman", "zypper"):
         if shutil.which(manager):
             return manager
-
     return None
-
-
-# ============================================================
-# FFmpeg
-# ============================================================
-
-def find_windows_ffmpeg() -> str | None:
-    ffmpeg = shutil.which("ffmpeg")
-
-    if ffmpeg:
-        return ffmpeg
-
-    home = Path.home()
-
-    winget_link = (
-            home
-            / "AppData"
-            / "Local"
-            / "Microsoft"
-            / "WinGet"
-            / "Links"
-            / "ffmpeg.exe"
-    )
-
-    if winget_link.exists():
-        return str(winget_link)
-
-    packages_dir = (
-            home
-            / "AppData"
-            / "Local"
-            / "Microsoft"
-            / "WinGet"
-            / "Packages"
-    )
-
-    if packages_dir.exists():
-        candidates = list(
-            packages_dir.glob(
-                "Gyan.FFmpeg*/**/bin/ffmpeg.exe"
-            )
-        )
-
-        if candidates:
-            return str(candidates[0])
-
-        candidates = list(
-            packages_dir.glob(
-                "Gyan.FFmpeg*/**/ffmpeg.exe"
-            )
-        )
-
-        if candidates:
-            return str(candidates[0])
-
-    return None
-
-
-def install_ffmpeg_windows() -> None:
-    winget = shutil.which("winget")
-
-    if not winget:
-        raise RuntimeError(
-            "找不到 winget，無法自動安裝 FFmpeg。"
-        )
-
-    print_info(
-        "Windows：使用 winget 安裝 FFmpeg..."
-    )
-
-    result = subprocess.run(
-        [
-            winget,
-            "install",
-            "--id",
-            "Gyan.FFmpeg",
-            "--exact",
-            "--accept-source-agreements",
-            "--accept-package-agreements",
-        ],
-        check=False,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "winget 安裝 FFmpeg 失敗，"
-            f"exit code = {result.returncode}"
-        )
 
 
 def install_ffmpeg_linux() -> None:
     manager = detect_linux_package_manager()
-
     if not manager:
-        raise RuntimeError(
-            "找不到支援的 Linux 套件管理器，"
-            "無法自動安裝 FFmpeg。"
-        )
+        raise RuntimeError("找不到支援的 Linux 套件管理器，無法自動安裝 FFmpeg。")
 
     prefix = sudo_prefix()
-
-    print_info(
-        f"Linux：偵測到套件管理器 {manager}"
-    )
+    print_info(f"Linux：使用 {manager} 安裝 FFmpeg...")
 
     if manager == "apt-get":
-        subprocess.check_call(
-            prefix + [manager, "update"]
-        )
-
-        subprocess.check_call(
-            prefix
-            + [
-                manager,
-                "install",
-                "-y",
-                "ffmpeg",
-            ]
-        )
-
-    elif manager in ("dnf", "yum"):
-        subprocess.check_call(
-            prefix
-            + [
-                manager,
-                "install",
-                "-y",
-                "ffmpeg",
-            ]
-        )
-
+        subprocess.check_call(prefix + [manager, "update"])
+        subprocess.check_call(prefix + [manager, "install", "-y", "ffmpeg"])
+    elif manager in {"dnf", "yum"}:
+        subprocess.check_call(prefix + [manager, "install", "-y", "ffmpeg"])
     elif manager == "pacman":
-        subprocess.check_call(
-            prefix
-            + [
-                manager,
-                "-Sy",
-                "--noconfirm",
-                "ffmpeg",
-            ]
-        )
-
+        subprocess.check_call(prefix + [manager, "-Sy", "--noconfirm", "ffmpeg"])
     elif manager == "zypper":
         subprocess.check_call(
-            prefix
-            + [
-                manager,
-                "--non-interactive",
-                "install",
-                "ffmpeg",
-            ]
+            prefix + [manager, "--non-interactive", "install", "ffmpeg"]
         )
 
 
 def install_ffmpeg_macos() -> None:
     brew = shutil.which("brew")
-
     if not brew:
         raise RuntimeError(
-            "找不到 Homebrew。\n"
-            "請先安裝 Homebrew，"
-            "再執行：\n\n"
-            "  brew install ffmpeg"
+            "找不到 Homebrew。請先安裝 Homebrew，再執行：brew install ffmpeg"
         )
-
-    print_info(
-        "macOS：使用 Homebrew 安裝 FFmpeg..."
-    )
-
-    subprocess.check_call(
-        [
-            brew,
-            "install",
-            "ffmpeg",
-        ]
-    )
+    print_info("macOS：使用 Homebrew 安裝 FFmpeg...")
+    subprocess.check_call([brew, "install", "ffmpeg"])
 
 
-def add_executable_dir_to_path(
-        executable: str,
-) -> None:
-    exe_dir = str(
-        Path(executable)
-        .resolve()
-        .parent
-    )
-
-    current = os.environ.get(
-        "PATH",
-        "",
-    )
-
-    parts = (
-        current.split(os.pathsep)
-        if current
-        else []
-    )
-
-    if exe_dir not in parts:
-        os.environ["PATH"] = (
-                exe_dir
-                + os.pathsep
-                + current
-        )
-
-
-def find_ffmpeg(
-        auto_install: bool = True,
-) -> str:
-    ffmpeg = shutil.which(
-        "ffmpeg"
-    )
-
+def find_ffmpeg(auto_install: bool = True) -> str:
+    ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
-        add_executable_dir_to_path(
-            ffmpeg
-        )
-
-        print_ok(
-            f"找到 FFmpeg：{ffmpeg}"
-        )
-
         return ffmpeg
 
-    if is_windows():
-        ffmpeg = find_windows_ffmpeg()
-
-        if ffmpeg:
-            add_executable_dir_to_path(
-                ffmpeg
-            )
-
-            print_ok(
-                f"找到 FFmpeg：{ffmpeg}"
-            )
-
-            return ffmpeg
-
     if not auto_install:
-        raise RuntimeError(
-            "找不到 FFmpeg。"
-        )
+        raise RuntimeError("找不到 FFmpeg。")
 
-    if is_windows():
-        install_ffmpeg_windows()
-
-        ffmpeg = (
-            find_windows_ffmpeg()
-        )
-
-    elif is_linux():
+    if is_linux():
         install_ffmpeg_linux()
-
-        ffmpeg = shutil.which(
-            "ffmpeg"
-        )
-
     elif is_macos():
         install_ffmpeg_macos()
-
-        ffmpeg = shutil.which(
-            "ffmpeg"
-        )
-
     else:
-        ffmpeg = None
+        raise RuntimeError("目前平台不支援自動安裝 FFmpeg。")
 
+    ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError(
-            "FFmpeg 安裝完成後仍找不到 ffmpeg。"
-        )
-
-    add_executable_dir_to_path(
-        ffmpeg
-    )
-
-    print_ok(
-        f"FFmpeg 安裝完成：{ffmpeg}"
-    )
-
+        raise RuntimeError("FFmpeg 安裝完成後仍找不到 ffmpeg。")
     return ffmpeg
 
 
 def check_ffmpeg() -> str:
-    ffmpeg = find_ffmpeg(
-        auto_install=True
-    )
-
+    ffmpeg = find_ffmpeg(auto_install=True)
     result = subprocess.run(
-        [
-            ffmpeg,
-            "-version",
-        ],
+        [ffmpeg, "-version"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
-
     if result.returncode != 0:
-        raise RuntimeError(
-            "FFmpeg 無法執行：\n"
-            f"{ffmpeg}\n\n"
-            f"{result.stderr}"
-        )
+        raise RuntimeError(f"FFmpeg 無法執行：\n{result.stderr}")
 
-    lines = (
-        result.stdout
-        .splitlines()
-    )
-
-    if lines:
-        print_ok(
-            lines[0]
-        )
-
+    first_line = result.stdout.splitlines()[0] if result.stdout else ffmpeg
+    print_ok(f"找到 FFmpeg：{ffmpeg}")
+    print_ok(first_line)
     return ffmpeg
 
 
 # ============================================================
-# ELUATE venv
+# ELUATE dedicated venv
 # ============================================================
 
 def get_venv_python() -> Path:
     if is_windows():
-        return (
-                TOOL_VENV
-                / "Scripts"
-                / "python.exe"
-        )
-
-    return (
-            TOOL_VENV
-            / "bin"
-            / "python"
-    )
-
-
-def get_venv_pip() -> Path:
-    if is_windows():
-        return (
-                TOOL_VENV
-                / "Scripts"
-                / "pip.exe"
-        )
-
-    return (
-            TOOL_VENV
-            / "bin"
-            / "pip"
-    )
+        return TOOL_VENV / "Scripts" / "python.exe"
+    return TOOL_VENV / "bin" / "python"
 
 
 def get_venv_eluate() -> Path:
     if is_windows():
-        return (
-                TOOL_VENV
-                / "Scripts"
-                / "eluate.exe"
-        )
-
-    return (
-            TOOL_VENV
-            / "bin"
-            / "eluate"
-    )
+        return TOOL_VENV / "Scripts" / "eluate.exe"
+    return TOOL_VENV / "bin" / "eluate"
 
 
 def install_python_venv_support_linux() -> None:
-    if not is_linux():
+    if not is_linux() or not shutil.which("apt-get"):
         return
 
-    apt = shutil.which(
-        "apt-get"
-    )
-
-    if not apt:
-        return
-
-    major = (
-        sys.version_info.major
-    )
-
-    minor = (
-        sys.version_info.minor
-    )
-
-    version_pkg = (
-        f"python{major}.{minor}-venv"
-    )
-
+    major = sys.version_info.major
+    minor = sys.version_info.minor
+    version_pkg = f"python{major}.{minor}-venv"
     prefix = sudo_prefix()
+    apt = shutil.which("apt-get") or "apt-get"
 
-    print_info(
-        "Python venv 功能不可用，"
-        "嘗試補安裝..."
-    )
-
-    subprocess.check_call(
-        prefix
-        + [
-            apt,
-            "update",
-        ]
-    )
-
+    subprocess.check_call(prefix + [apt, "update"])
     result = subprocess.run(
-        prefix
-        + [
-            apt,
-            "install",
-            "-y",
-            version_pkg,
-        ],
-        check=False,
-        )
-
+        prefix + [apt, "install", "-y", version_pkg], check=False
+    )
     if result.returncode != 0:
-        subprocess.check_call(
-            prefix
-            + [
-                apt,
-                "install",
-                "-y",
-                "python3-venv",
-            ]
-        )
+        subprocess.check_call(prefix + [apt, "install", "-y", "python3-venv"])
 
 
 def ensure_tool_venv() -> Path:
-    python_path = (
-        get_venv_python()
-    )
-
+    python_path = get_venv_python()
     if python_path.exists():
         return python_path
 
-    TOOL_HOME.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    print_info(
-        "建立 ELUATE 專用 venv："
-        f"{TOOL_VENV}"
-    )
+    TOOL_HOME.mkdir(parents=True, exist_ok=True)
+    print_info(f"建立 ELUATE 專用 venv：{TOOL_VENV}")
 
     result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "venv",
-            str(TOOL_VENV),
-        ],
-        check=False,
+        [sys.executable, "-m", "venv", str(TOOL_VENV)], check=False
     )
-
     if result.returncode != 0:
         if is_linux():
             install_python_venv_support_linux()
-
             subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "venv",
-                    str(TOOL_VENV),
-                ]
+                [sys.executable, "-m", "venv", str(TOOL_VENV)]
             )
-
         else:
-            raise RuntimeError(
-                "建立 ELUATE 專用 venv 失敗。"
-            )
+            raise RuntimeError("建立 ELUATE 專用 venv 失敗。")
 
     if not python_path.exists():
-        raise RuntimeError(
-            "建立 venv 後仍找不到 Python：\n"
-            f"{python_path}"
-        )
+        raise RuntimeError(f"建立 venv 後仍找不到 Python：{python_path}")
 
-    print_ok(
-        "ELUATE 專用 venv 已建立："
-        f"{TOOL_VENV}"
-    )
-
+    print_ok(f"ELUATE 專用 venv 已建立：{TOOL_VENV}")
     return python_path
 
 
-def find_eluate() -> str | None:
-    managed = (
-        get_venv_eluate()
-    )
-
-    if managed.exists():
-        return str(managed)
-
-    return None
-
-
 def install_eluate() -> str:
-    print_info(
-        "目前找不到本工具管理的 ELUATE。"
-    )
+    python_path = ensure_tool_venv()
 
-    python_path = (
-        ensure_tool_venv()
-    )
-
-    print_info(
-        "更新 ELUATE venv 的 "
-        "pip / setuptools / wheel..."
-    )
-
+    print_info("更新 ELUATE venv 的 pip / setuptools / wheel...")
     subprocess.check_call(
         [
-            str(python_path),
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "pip",
-            "setuptools",
-            "wheel",
+            str(python_path), "-m", "pip", "install", "--upgrade",
+            "pip", "setuptools", "wheel",
         ]
     )
 
-    print_info(
-        "開始安裝 ELUATE..."
-    )
-
+    print_info("開始安裝 ELUATE...")
     subprocess.check_call(
-        [
-            str(python_path),
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            ELUATE_PACKAGE,
-        ]
+        [str(python_path), "-m", "pip", "install", "--upgrade", ELUATE_PACKAGE]
     )
 
-    eluate = (
-        get_venv_eluate()
-    )
-
+    eluate = get_venv_eluate()
     if not eluate.exists():
-        raise RuntimeError(
-            "ELUATE 安裝完成，"
-            "但找不到 CLI：\n"
-            f"{eluate}"
-        )
+        raise RuntimeError(f"ELUATE 安裝完成，但找不到 CLI：{eluate}")
 
-    print_ok(
-        f"ELUATE 安裝完成：{eluate}"
-    )
-
+    print_ok(f"ELUATE 安裝完成：{eluate}")
     return str(eluate)
 
 
 def ensure_eluate() -> str:
-    executable = (
-        find_eluate()
-    )
-
-    if executable:
-        return executable
-
+    managed = get_venv_eluate()
+    if managed.exists():
+        return str(managed)
     return install_eluate()
 
 
-# ============================================================
-# PyTorch / Device
-# ============================================================
+def ensure_checkpoint(eluate_path: str, checkpoint: str) -> None:
+    model_path = ELUATE_MODELS_DIR / f"checkpoint-{checkpoint}.ckpt"
+    if model_path.exists():
+        return
 
-def python_for_eluate(
-        eluate_path: str,
-) -> str:
-    eluate = (
-        Path(eluate_path)
-        .resolve()
-    )
+    print_warn(f"找不到 checkpoint：{model_path}")
+    print_info("執行 eluate setup 下載模型...")
 
-    if is_windows():
-        candidate = (
-                eluate.parent
-                / "python.exe"
-        )
+    # ELUATE setup 預設主要準備 multi；其他 checkpoint 仍可能在首次使用時下載。
+    result = subprocess.run([eluate_path, "setup"])
+    if result.returncode != 0:
+        raise RuntimeError(f"eluate setup 失敗，exit code = {result.returncode}")
 
-    else:
-        candidate = (
-                eluate.parent
-                / "python"
-        )
 
+def python_for_eluate(eluate_path: str) -> str:
+    eluate = Path(eluate_path).resolve()
+    candidate = eluate.parent / ("python.exe" if is_windows() else "python")
     if candidate.exists():
         return str(candidate)
-
-    raise RuntimeError(
-        "無法找到 ELUATE 所屬 Python：\n"
-        f"{eluate}"
-    )
+    raise RuntimeError(f"無法找到 ELUATE 所屬 Python：{eluate}")
 
 
-def get_torch_status(
-        python_executable: str,
-) -> dict:
+# ============================================================
+# PyTorch device inspection
+# ============================================================
+
+def get_torch_status(python_executable: str) -> dict[str, Any]:
     code = r'''
 import json
-
 try:
     import torch
-
-    cuda_available = bool(
-        torch.cuda.is_available()
-    )
-
-    mps_built = bool(
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_built()
-    )
-
-    mps_available = bool(
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-    )
-
-    cuda_name = None
-
-    if cuda_available:
-        try:
-            cuda_name = torch.cuda.get_device_name(0)
-        except Exception:
-            pass
-
+    cuda_available = bool(torch.cuda.is_available())
+    mps_built = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_built())
+    mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     data = {
         "torch_installed": True,
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
         "cuda_available": cuda_available,
-        "cuda_device_name": cuda_name,
+        "cuda_device_name": torch.cuda.get_device_name(0) if cuda_available else None,
         "mps_built": mps_built,
         "mps_available": mps_available,
     }
-
 except Exception as e:
-    data = {
-        "torch_installed": False,
-        "error": f"{type(e).__name__}: {e}",
-    }
-
-print(
-    json.dumps(
-        data,
-        ensure_ascii=False
-    )
-)
+    data = {"torch_installed": False, "error": f"{type(e).__name__}: {e}"}
+print(json.dumps(data, ensure_ascii=False))
 '''
 
     result = subprocess.run(
-        [
-            python_executable,
-            "-c",
-            code,
-        ],
+        [python_executable, "-c", code],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -891,540 +579,423 @@ print(
     if result.returncode != 0:
         return {
             "torch_installed": False,
-            "error": (
-                    result.stderr.strip()
-                    or
-                    "無法執行 PyTorch 檢查"
-            ),
+            "error": result.stderr.strip() or "無法執行 PyTorch 檢查",
         }
 
     try:
-        last_line = (
-            result.stdout
-            .strip()
-            .splitlines()[-1]
-        )
-
-        return json.loads(
-            last_line
-        )
-
+        return json.loads(result.stdout.strip().splitlines()[-1])
     except Exception:
         return {
             "torch_installed": False,
-            "error": (
-                "無法解析 PyTorch 狀態：\n"
-                f"{result.stdout}"
-            ),
+            "error": f"無法解析 PyTorch 狀態：{result.stdout.strip()}",
         }
 
 
-def show_device_status(
-        eluate_path: str,
-        requested_device: str | None = None,
-) -> dict:
-    python_executable = (
-        python_for_eluate(
-            eluate_path
-        )
-    )
+def show_device_status(eluate_path: str, requested_device: str | None) -> dict[str, Any]:
+    python_executable = python_for_eluate(eluate_path)
+    print_info(f"檢查 ELUATE Python 環境：{python_executable}")
 
-    print_info(
-        "檢查 ELUATE Python 環境："
-        f"{python_executable}"
-    )
-
-    status = get_torch_status(
-        python_executable
-    )
-
-    if not status.get(
-            "torch_installed"
-    ):
+    status = get_torch_status(python_executable)
+    if not status.get("torch_installed"):
         raise RuntimeError(
             "ELUATE 環境無法載入 PyTorch：\n"
             f"{status.get('error', '未知錯誤')}"
         )
 
-    print_ok(
-        "PyTorch："
-        f"{status.get('torch_version')}"
-    )
+    print_ok(f"PyTorch：{status.get('torch_version')}")
 
-    cuda_available = (
-        status.get(
-            "cuda_available",
-            False,
-        )
-    )
+    cuda_available = bool(status.get("cuda_available"))
+    mps_available = bool(status.get("mps_available"))
 
-    mps_available = (
-        status.get(
-            "mps_available",
-            False,
-        )
-    )
-
-    cuda_runtime = (
-        status.get(
-            "torch_cuda_version"
-        )
-    )
-
-    if cuda_runtime:
-        print_info(
-            "PyTorch CUDA runtime："
-            f"{cuda_runtime}"
-        )
+    if status.get("torch_cuda_version"):
+        print_info(f"PyTorch CUDA runtime：{status['torch_cuda_version']}")
 
     if cuda_available:
-        print_ok(
-            "CUDA 可用："
-            f"{status.get('cuda_device_name')}"
-        )
-
+        print_ok(f"CUDA 可用：{status.get('cuda_device_name')}")
     elif is_linux():
-        print_warn(
-            "CUDA 不可用。"
-        )
+        print_warn("CUDA 不可用。")
 
     if mps_available:
-        print_ok(
-            "MPS 可用：Apple Metal GPU"
-        )
-
+        print_ok("MPS 可用：Apple Metal GPU")
     elif is_macos():
-        if status.get(
-                "mps_built"
-        ):
-            print_warn(
-                "PyTorch 包含 MPS 支援，"
-                "但目前裝置無法使用 MPS。"
-            )
-
+        if status.get("mps_built"):
+            print_warn("PyTorch 包含 MPS 支援，但目前裝置無法使用 MPS。")
         else:
-            print_warn(
-                "目前 PyTorch 沒有 MPS backend。"
-            )
+            print_warn("目前 PyTorch 沒有 MPS backend。")
 
-    if requested_device == "cuda":
-        if not cuda_available:
-            raise RuntimeError(
-                "你指定了 --device cuda，"
-                "但 ELUATE 的 PyTorch "
-                "無法使用 CUDA。"
-            )
+    if requested_device == "cuda" and not cuda_available:
+        raise RuntimeError("指定 --device cuda，但 ELUATE 的 PyTorch 無法使用 CUDA。")
 
-    if requested_device == "mps":
-        if not mps_available:
-            raise RuntimeError(
-                "你指定了 --device mps，"
-                "但目前 PyTorch "
-                "無法使用 MPS。"
-            )
-
-    if requested_device == "cpu":
-        print_info(
-            "指定使用 CPU。"
-        )
+    if requested_device == "mps" and not mps_available:
+        raise RuntimeError("指定 --device mps，但目前 PyTorch 無法使用 MPS。")
 
     if requested_device is None:
         if cuda_available:
-            print_info(
-                "建議運算裝置：CUDA"
-            )
-
+            print_info("自動裝置預期使用：CUDA")
         elif mps_available:
-            print_info(
-                "建議運算裝置：MPS"
-            )
-
+            print_info("自動裝置預期使用：MPS")
         else:
-            print_warn(
-                "目前沒有偵測到 CUDA / MPS，"
-                "預期將使用 CPU。"
-            )
+            print_info("自動裝置預期使用：CPU")
 
     return status
 
 
 # ============================================================
-# Input / Output
+# Input / output
 # ============================================================
 
-def validate_input(
-        input_path: Path,
-) -> Path:
-    input_path = (
-        input_path
-        .expanduser()
-        .resolve()
-    )
-
+def validate_input(path_text: str) -> Path:
+    input_path = Path(path_text).expanduser().resolve()
     if not input_path.exists():
-        raise FileNotFoundError(
-            "找不到影片：\n"
-            f"{input_path}"
-        )
-
+        raise FileNotFoundError(f"找不到影片：{input_path}")
     if not input_path.is_file():
-        raise ValueError(
-            "輸入路徑不是檔案：\n"
-            f"{input_path}"
-        )
+        raise ValueError(f"輸入路徑不是檔案：{input_path}")
 
-    extension = (
-        input_path
-        .suffix
-        .lower()
-    )
-
-    if (
-            extension
-            not in
-            SUPPORTED_EXTENSIONS
-    ):
+    extension = input_path.suffix.lower()
+    if extension not in SUPPORTED_EXTENSIONS:
         print_warn(
-            f"副檔名 {extension} "
-            "不在常見影片格式清單，"
-            "仍會交給 ELUATE / FFmpeg 嘗試。"
+            f"副檔名 {extension} 不在常見影片格式清單，仍交給 FFmpeg / ELUATE 嘗試。"
         )
-
     return input_path
 
 
-def create_output_path(
-        input_path: Path,
-        output_path: str | None,
-) -> Path:
-    if output_path:
-        output = (
-            Path(output_path)
-            .expanduser()
-            .resolve()
-        )
-
+def create_output_path(input_path: Path, output_text: str | None) -> Path:
+    if output_text:
+        output = Path(output_text).expanduser().resolve()
     else:
-        output = (
-            input_path.with_name(
-                f"{input_path.stem}"
-                f"_no_bgm"
-                f"{input_path.suffix}"
-            )
+        output = input_path.with_name(
+            f"{input_path.stem}_no_bgm{input_path.suffix}"
         )
 
     if output == input_path:
-        raise ValueError(
-            "輸出檔案不能與輸入檔案相同。"
-        )
+        raise ValueError("輸出檔案不能與輸入檔案相同。")
 
-    output.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    output.parent.mkdir(parents=True, exist_ok=True)
     return output
 
 
-def create_temp_output_path(
-        output_path: Path,
-) -> Path:
-    return (
-        output_path.with_name(
-            f"{output_path.stem}"
-            ".processing"
-            f"{output_path.suffix}"
-        )
-    )
+def format_size(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PB"
 
 
 # ============================================================
-# ELUATE
+# ELUATE Python API runner
 # ============================================================
 
-def print_checkpoint_repair_hint(
-        checkpoint: str,
-) -> None:
-    print()
+ELUATE_API_RUNNER = r'''
+import json
+import sys
+from pathlib import Path
+import eluate
 
-    print_warn(
-        "若上方 ELUATE 錯誤訊息包含 "
-        "checkpoint / SHA256 mismatch，"
-        "可以刪除模型後重新下載。"
-    )
+input_path = Path(sys.argv[1])
+output_dir = Path(sys.argv[2])
+metadata_path = Path(sys.argv[3])
+checkpoint = sys.argv[4]
+device_arg = sys.argv[5]
+force = sys.argv[6] == "1"
 
-    model_path = (
-            ELUATE_MODELS_DIR
-            / f"checkpoint-{checkpoint}.ckpt"
-    )
+device = None if device_arg == "auto" else device_arg
 
-    print_info(
-        "修復指令："
-    )
+stage_names = {
+    "extract": "Extract",
+    "load_model": "Load model",
+    "separate": "Separate",
+    "compile": "Compile",
+}
 
-    print()
+last_percent = -1
+last_stage = None
 
-    print(
-        f"  rm -f {model_path}"
-    )
+def on_progress(fraction: float, stage: str) -> None:
+    global last_percent, last_stage
+    percent = max(0, min(100, int(round(float(fraction) * 100))))
+    label = stage_names.get(stage, stage)
+    if percent != last_percent or stage != last_stage:
+        bar_width = 30
+        filled = int(bar_width * percent / 100)
+        bar = "█" * filled + "-" * (bar_width - filled)
+        print(f"\r[ELUATE] {label:<12} [{bar}] {percent:3d}%", end="", flush=True)
+        last_percent = percent
+        last_stage = stage
+    if percent >= 100:
+        print(flush=True)
 
-    print(
-        f"  {get_venv_eluate()} setup"
-    )
+result = eluate.elute(
+    input_path,
+    outputs=("speech", "sfx"),
+    output_dir=output_dir,
+    overwrite=True,
+    force=force,
+    on_progress=on_progress,
+    device=device,
+    checkpoint=checkpoint,
+)
 
-    print()
+payload = {
+    "speech": str(result.speech) if result.speech else None,
+    "sfx": str(result.sfx) if result.sfx else None,
+    "duration": result.duration,
+    "processing_time": result.processing_time,
+}
+metadata_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+'''
 
 
-def remove_bgm(
+def extract_stems(
+        eluate_path: str,
         input_path: Path,
+        work_dir: Path,
+        checkpoint: str,
+        device: str | None,
+        force: bool,
+) -> tuple[Path, Path, dict[str, Any]]:
+    eluate_python = python_for_eluate(eluate_path)
+    metadata_path = work_dir / "eluate_result.json"
+
+    print_header("ELUATE AI 分離")
+    print_info("Music：固定丟棄")
+    print_info("輸出 stems：Speech + SFX")
+    print()
+
+    command = [
+        eluate_python,
+        "-c",
+        ELUATE_API_RUNNER,
+        str(input_path),
+        str(work_dir),
+        str(metadata_path),
+        checkpoint,
+        device or "auto",
+        "1" if force else "0",
+        ]
+
+    process = subprocess.run(command)
+    if process.returncode != 0:
+        model_path = ELUATE_MODELS_DIR / f"checkpoint-{checkpoint}.ckpt"
+        print_warn(
+            "ELUATE 執行失敗。如果上方訊息包含 checkpoint / SHA256 mismatch，"
+            "可刪除模型後重新 setup："
+        )
+        print(f"  rm -f {model_path}")
+        print(f"  {eluate_path} setup")
+        raise RuntimeError(f"ELUATE API 執行失敗，exit code = {process.returncode}")
+
+    if not metadata_path.exists():
+        raise RuntimeError("ELUATE 已結束，但找不到結果 metadata。")
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    speech = Path(metadata["speech"]) if metadata.get("speech") else None
+    sfx = Path(metadata["sfx"]) if metadata.get("sfx") else None
+
+    if speech is None or not speech.exists():
+        raise RuntimeError("ELUATE 沒有產生 speech stem。")
+    if sfx is None or not sfx.exists():
+        raise RuntimeError("ELUATE 沒有產生 sfx stem。")
+
+    print_ok(f"Speech stem：{speech}")
+    print_ok(f"SFX stem：{sfx}")
+    return speech, sfx, metadata
+
+
+# ============================================================
+# FFmpeg mix / mux
+# ============================================================
+
+def build_audio_filter(
+        speech_volume: float,
+        sfx_volume: float,
+        limiter: bool,
+        limiter_level: float,
+) -> str:
+    parts = [
+        f"[1:a]volume={speech_volume}[speech]",
+        f"[2:a]volume={sfx_volume}[sfx]",
+        "[speech][sfx]amix=inputs=2:duration=longest:normalize=0[mix]",
+    ]
+
+    if limiter:
+        parts.append(f"[mix]alimiter=limit={limiter_level}[aout]")
+    else:
+        parts.append("[mix]anull[aout]")
+
+    return ";".join(parts)
+
+
+def mux_adjusted_audio(
+        ffmpeg: str,
+        input_path: Path,
+        speech_path: Path,
+        sfx_path: Path,
         output_path: Path,
         *,
-        eluate_path: str,
-        checkpoint: str = "multi",
-        device: str | None = None,
-        force: bool = False,
+        speech_volume: float,
+        sfx_volume: float,
+        audio_codec: str,
+        audio_bitrate: str | None,
+        limiter: bool,
+        limiter_level: float,
+        overwrite: bool,
 ) -> None:
-    temp_output = (
-        create_temp_output_path(
-            output_path
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"輸出檔已存在，而且 processing.overwrite=false：{output_path}"
         )
-    )
 
+    temp_output = output_path.with_name(
+        f".{output_path.stem}.processing{output_path.suffix}"
+    )
     if temp_output.exists():
         temp_output.unlink()
 
+    filter_complex = build_audio_filter(
+        speech_volume,
+        sfx_volume,
+        limiter,
+        limiter_level,
+    )
+
     command = [
-        eluate_path,
-        str(input_path),
-        "-o",
-        str(temp_output),
+        ffmpeg,
+        "-y",
+        "-i", str(input_path),
+        "-i", str(speech_path),
+        "-i", str(sfx_path),
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0",
+        "-map", "[aout]",
+        "-map_metadata", "0",
+        "-c:v", "copy",
+        "-c:a", audio_codec,
     ]
 
-    if checkpoint != "multi":
-        command.extend(
-            [
-                "--checkpoint",
-                checkpoint,
-            ]
-        )
+    if audio_bitrate:
+        command.extend(["-b:a", audio_bitrate])
 
-    if device:
-        command.extend(
-            [
-                "--device",
-                device,
-            ]
-        )
+    # 若原檔有字幕則盡量一併保留；不支援的容器會由 FFmpeg 回報。
+    command.extend([
+        "-map", "0:s?",
+        "-c:s", "copy",
+        str(temp_output),
+    ])
 
-    if force:
-        command.append(
-            "--force"
-        )
+    print_header("Speech / SFX 音量調整與 Mux")
+    print_info(f"Speech volume：{speech_volume:.2f}x")
+    print_info(f"SFX volume：{sfx_volume:.2f}x")
+    print_info("BGM：0%（固定移除）")
+    print_info(f"Limiter：{'ON' if limiter else 'OFF'}")
 
-    print_header(
-        "開始 AI BGM 移除"
-    )
-
-    print_info(
-        f"輸入：{input_path}"
-    )
-
-    print_info(
-        f"輸出：{output_path}"
-    )
-
-    print_info(
-        f"模型：BandIt v2 / {checkpoint}"
-    )
-
-    print_info(
-        "Device："
-        f"{device if device else '自動偵測'}"
-    )
-
-    print()
-
-    # 重要：
-    # 不捕捉 stdout/stderr，
-    # 讓 ELUATE 直接連目前 Terminal，
-    # 保留 Rich / tqdm / 原生進度條。
-    process = subprocess.run(
-        command
-    )
-
-    if process.returncode != 0:
+    result = subprocess.run(command)
+    if result.returncode != 0:
         if temp_output.exists():
-            try:
-                temp_output.unlink()
-            except OSError:
-                pass
-
-        print_checkpoint_repair_hint(
-            checkpoint
-        )
-
-        raise RuntimeError(
-            "ELUATE 執行失敗，"
-            f"exit code = {process.returncode}"
-        )
+            temp_output.unlink(missing_ok=True)
+        raise RuntimeError(f"FFmpeg 混音 / mux 失敗，exit code = {result.returncode}")
 
     if not temp_output.exists():
-        raise RuntimeError(
-            "ELUATE 顯示執行完成，"
-            "但找不到暫存輸出影片：\n"
-            f"{temp_output}"
-        )
+        raise RuntimeError("FFmpeg 顯示成功，但找不到暫存輸出檔。")
 
     if output_path.exists():
-        print_warn(
-            "輸出檔已存在，"
-            "處理成功後將覆蓋：\n"
-            f"{output_path}"
-        )
-
         output_path.unlink()
-
-    temp_output.replace(
-        output_path
-    )
+    temp_output.replace(output_path)
 
 
 # ============================================================
-# File size
+# Main processing
 # ============================================================
 
-def format_size(
-        size: int,
-) -> str:
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-    ]
-
-    value = float(size)
-
-    for unit in units:
-        if value < 1024:
-            return (
-                f"{value:.2f} {unit}"
-            )
-
-        value /= 1024
-
-    return (
-        f"{value:.2f} PB"
-    )
-
-
-# ============================================================
-# Main process
-# ============================================================
-
-def process_video(
-        input_file: str,
-        output_file: str | None = None,
-        checkpoint: str = "multi",
-        device: str | None = None,
-        force: bool = False,
-) -> Path:
-    print_header(
-        "Remove Video BGM"
-    )
-
+def process_video(config: dict[str, Any]) -> Path:
+    print_header("Video BGM Remover / Speech & SFX Mixer")
     show_platform_info()
-
     validate_platform()
 
-    input_path = validate_input(
-        Path(input_file)
-    )
+    input_path = validate_input(config["input"])
+    output_path = create_output_path(input_path, config.get("output"))
 
-    output_path = (
-        create_output_path(
-            input_path,
-            output_file,
-        )
-    )
+    eluate_cfg = config["eluate"]
+    audio_cfg = config["audio"]
+    processing_cfg = config["processing"]
 
-    print_info(
-        "檢查 FFmpeg..."
-    )
+    print_info(f"輸入：{input_path}")
+    print_info(f"輸出：{output_path}")
+    print_info(f"Checkpoint：{eluate_cfg['checkpoint']}")
+    print_info(f"Device：{eluate_cfg['device'] or 'auto'}")
+    print_info(f"Speech：{audio_cfg['speech_volume']:.2f}x")
+    print_info(f"SFX：{audio_cfg['sfx_volume']:.2f}x")
+    print_info("BGM：0%（固定移除）")
 
-    check_ffmpeg()
+    print_info("檢查 FFmpeg...")
+    ffmpeg = check_ffmpeg()
 
-    print_info(
-        "檢查 ELUATE..."
-    )
-
+    print_info("檢查 ELUATE...")
     eluate = ensure_eluate()
+    print_ok(f"ELUATE：{eluate}")
 
-    print_ok(
-        f"ELUATE：{eluate}"
-    )
+    ensure_checkpoint(eluate, eluate_cfg["checkpoint"])
+    show_device_status(eluate, eluate_cfg["device"])
 
-    show_device_status(
-        eluate,
-        requested_device=device,
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    remove_bgm(
-        input_path,
-        output_path,
-        eluate_path=eluate,
-        checkpoint=checkpoint,
-        device=device,
-        force=force,
-    )
+    keep_stems = processing_cfg["keep_stems"]
+    if keep_stems:
+        work_dir = output_path.parent / f"{output_path.stem}_stems"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        temp_context = None
+    else:
+        temp_context = tempfile.TemporaryDirectory(prefix="video_bgm_remover_")
+        work_dir = Path(temp_context.name)
 
-    print_header(
-        "處理完成"
-    )
-
-    print_ok(
-        "輸出影片：\n"
-        f"{output_path}"
-    )
-
-    print_info(
-        "原始大小："
-        + format_size(
-            input_path
-            .stat()
-            .st_size
+    try:
+        speech_path, sfx_path, metadata = extract_stems(
+            eluate,
+            input_path,
+            work_dir,
+            eluate_cfg["checkpoint"],
+            eluate_cfg["device"],
+            eluate_cfg["force"],
         )
-    )
 
-    print_info(
-        "輸出大小："
-        + format_size(
-            output_path
-            .stat()
-            .st_size
+        mux_adjusted_audio(
+            ffmpeg,
+            input_path,
+            speech_path,
+            sfx_path,
+            output_path,
+            speech_volume=audio_cfg["speech_volume"],
+            sfx_volume=audio_cfg["sfx_volume"],
+            audio_codec=audio_cfg["codec"],
+            audio_bitrate=audio_cfg["bitrate"],
+            limiter=audio_cfg["limiter"],
+            limiter_level=audio_cfg["limiter_level"],
+            overwrite=processing_cfg["overwrite"],
         )
-    )
 
-    print()
+        print_header("處理完成")
+        print_ok(f"輸出影片：{output_path}")
+        print_info(f"原始大小：{format_size(input_path.stat().st_size)}")
+        print_info(f"輸出大小：{format_size(output_path.stat().st_size)}")
+        if metadata.get("processing_time") is not None:
+            print_info(f"ELUATE 分離時間：{float(metadata['processing_time']):.2f} 秒")
 
-    print(
-        "音訊處理結果："
-    )
+        print()
+        print("音訊結果：")
+        print("  Music   → 移除")
+        print(f"  Speech  → {audio_cfg['speech_volume']:.2f}x")
+        print(f"  SFX     → {audio_cfg['sfx_volume']:.2f}x")
 
-    print(
-        "  Speech  → 保留"
-    )
+        if keep_stems:
+            print_info(f"保留 stems：{work_dir}")
 
-    print(
-        "  SFX     → 保留"
-    )
+        return output_path
 
-    print(
-        "  Music   → 移除"
-    )
-
-    return output_path
+    finally:
+        if temp_context is not None:
+            temp_context.cleanup()
 
 
 # ============================================================
@@ -1434,124 +1005,69 @@ def process_video(
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "使用 ELUATE / BandIt v2 "
-            "移除影片 BGM，"
-            "盡可能保留人聲與音效。"
+            "使用 ELUATE / BandIt v2 固定移除 BGM，"
+            "並分別調整 Speech / SFX 音量。"
         )
     )
 
     parser.add_argument(
         "input",
-        help="輸入影片",
-    )
-
-    parser.add_argument(
-        "-o",
-        "--output",
+        nargs="?",
         default=None,
-        help=(
-            "輸出影片。"
-            "未指定時自動產生 "
-            "*_no_bgm.<ext>"
-        ),
+        help="輸入影片；若省略則從 YAML 的 input 讀取。",
     )
-
     parser.add_argument(
-        "--checkpoint",
-        default="multi",
-        choices=[
-            "multi",
-            "eng",
-            "deu",
-            "fra",
-            "spa",
-            "cmn",
-            "fao",
-        ],
-        help=(
-            "BandIt checkpoint。"
-            "日文遊戲建議維持 multi。"
-        ),
-    )
-
-    parser.add_argument(
-        "--device",
+        "--config",
         default=None,
-        choices=[
-            "cuda",
-            "cpu",
-            "mps",
-        ],
-        help=(
-            "指定運算裝置。"
-            "NVIDIA/Linux/WSL 使用 cuda；"
-            "支援的 macOS GPU 使用 mps；"
-            "否則使用 cpu。"
-        ),
+        help="YAML 設定檔；未指定時自動尋找腳本同目錄 config.yaml。",
     )
-
+    parser.add_argument("-o", "--output", default=None, help="覆蓋 YAML output。")
+    parser.add_argument("--checkpoint", choices=sorted(CHECKPOINTS), default=None)
+    parser.add_argument("--device", choices=sorted(DEVICES), default=None)
     parser.add_argument(
-        "--force",
-        action="store_true",
-        help=(
-            "傳遞 ELUATE --force，"
-            "跳過影片長度 / "
-            "磁碟空間預檢查。"
-        ),
+        "--force", action=argparse.BooleanOptionalAction, default=None,
+        help="覆蓋 YAML eluate.force。",
     )
-
+    parser.add_argument("--speech-volume", type=float, default=None)
+    parser.add_argument("--sfx-volume", type=float, default=None)
+    parser.add_argument("--audio-codec", default=None)
+    parser.add_argument("--audio-bitrate", default=None)
+    parser.add_argument(
+        "--limiter", action=argparse.BooleanOptionalAction, default=None,
+        help="啟用/停用混音後 limiter。",
+    )
+    parser.add_argument(
+        "--overwrite", action=argparse.BooleanOptionalAction, default=None,
+        help="是否允許覆蓋既有輸出檔。",
+    )
+    parser.add_argument(
+        "--keep-stems", action=argparse.BooleanOptionalAction, default=None,
+        help="是否保留 speech/sfx WAV stems。",
+    )
     return parser
 
 
-# ============================================================
-# Entry Point
-# ============================================================
-
 def main() -> int:
-    parser = (
-        create_parser()
-    )
-
-    args = (
-        parser.parse_args()
-    )
+    args = create_parser().parse_args()
 
     try:
-        process_video(
-            input_file=args.input,
-            output_file=args.output,
-            checkpoint=args.checkpoint,
-            device=args.device,
-            force=args.force,
-        )
-
+        config, _ = build_config(args)
+        process_video(config)
         return 0
 
     except KeyboardInterrupt:
         print()
-
-        print_error(
-            "使用者取消處理。"
-        )
-
+        print_error("使用者取消處理。")
         return 130
 
-    except Exception as e:
+    except Exception as exc:
         print()
-
-        print_header(
-            "處理失敗"
-        )
-
-        print_error(
-            f"{type(e).__name__}: {e}"
-        )
-
+        print_header("處理失敗")
+        print_error(f"{type(exc).__name__}: {exc}")
         print()
 
         import traceback
         traceback.print_exc()
-
         return 1
 
 
