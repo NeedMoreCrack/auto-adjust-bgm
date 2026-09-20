@@ -256,10 +256,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
 
     audio["speech_volume"] = number_in_range(
-        "audio.speech_volume", audio.get("speech_volume", 1.0), 0.0, 2.0
+        "audio.speech_volume", audio.get("speech_volume", 1.0), 0.0, 3.0
     )
     audio["sfx_volume"] = number_in_range(
-        "audio.sfx_volume", audio.get("sfx_volume", 1.0), 0.0, 2.0
+        "audio.sfx_volume", audio.get("sfx_volume", 1.0), 0.0, 3.0
     )
     audio["limiter_level"] = number_in_range(
         "audio.limiter_level", audio.get("limiter_level", 0.95), 0.1, 1.0
@@ -1137,12 +1137,13 @@ def build_no_bgm_filter(
 
         output = original - speech * 0.5 + sfx * 1.0
 
-    因此 no_bgm 模式可支援 0.0 ~ 2.0：
+    因此 no_bgm 模式可支援 0.0 ~ 3.0：
         0.0 = 嘗試完全扣除該 stem
         0.5 = 約 50%
         1.0 = 維持原始音量
         1.5 = 約 150%
         2.0 = 約 200%
+        3.0 = 約 300%
 
     注意：
         當倍率低於 1.0 時，本質上是從原始音訊中反相扣除對應 stem。
@@ -1425,8 +1426,14 @@ def create_parser() -> argparse.ArgumentParser:
         "--force", action=argparse.BooleanOptionalAction, default=None,
         help="覆蓋 YAML eluate.force。",
     )
-    parser.add_argument("--speech-volume", type=float, default=None)
-    parser.add_argument("--sfx-volume", type=float, default=None)
+    parser.add_argument(
+        "--speech-volume", type=float, default=None,
+        help="Speech 目標音量倍率，允許 0.0 ~ 3.0；1.0=維持、0.5=約50%、2.0=約200%、3.0=約300%。",
+    )
+    parser.add_argument(
+        "--sfx-volume", type=float, default=None,
+        help="SFX 目標音量倍率，允許 0.0 ~ 3.0；1.0=維持、0.5=約50%、2.0=約200%、3.0=約300%。",
+    )
     parser.add_argument("--audio-codec", default=None)
     parser.add_argument("--audio-bitrate", default=None)
     parser.add_argument(

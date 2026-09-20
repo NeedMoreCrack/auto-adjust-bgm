@@ -30,15 +30,39 @@ eluate:
 
 audio:
   # Speech 目標音量倍率。
+  # 允許範圍：0.0 ~ 3.0
+  #
+  # 0.0 = 在 no_bgm 模式下嘗試完全扣除 Speech；
+  #       remove_bgm 模式則是不把 Speech 混回輸出。
+  # 0.5 = 約 50%
   # 1.0 = 維持原本
-  # 1.2 = 約增加 20%
-  # remove_bgm 模式允許 0.0 ~ 2.0
-  # no_bgm 模式目前要求 >= 1.0，因為此模式採「保留原音 + 疊加增益 stem」策略。
+  # 1.2 = 約 120%（增加約 20%）
+  # 2.0 = 約 200%
+  # 3.0 = 約 300%
+  #
+  # 注意：
+  # no_bgm 模式若設定低於 1.0，會使用反相 Speech stem 從原始音訊中扣除，
+  # 可能因 AI 分離誤差產生少量相位抵銷、殘影或金屬感。
   speech_volume: 1.0
 
   # SFX 目標音量倍率。
-  # 例：1.5 = 音效增強到約 150%
-  # no_bgm 模式若只是「人聲不變、音效放大」，推薦 speech=1.0 / sfx=1.3~1.6。
+  # 允許範圍：0.0 ~ 3.0
+  #
+  # 0.0 = 在 no_bgm 模式下嘗試完全扣除 SFX；
+  #       remove_bgm 模式則是不把 SFX 混回輸出。
+  # 0.5 = 約 50%
+  # 1.0 = 維持原本
+  # 1.5 = 約 150%
+  # 2.0 = 約 200%
+  # 3.0 = 約 300%
+  #
+  # 若只是想讓遊戲音效比人聲突出，可先從：
+  #   speech_volume: 1.0
+  #   sfx_volume: 1.3 ~ 1.6
+  # 開始測試，再視需要提高。
+  #
+  # 倍率越高越容易碰到 clipping / limiter，
+  # 即使 limiter 開啟，過高的增益仍可能使動態被壓縮或產生失真。
   sfx_volume: 1.5
 
   # 最終影片音訊編碼。
@@ -50,7 +74,9 @@ audio:
   # 混音後套 limiter，降低增益後 clipping / 爆音風險。
   limiter: true
 
-  # limiter 上限，0.1 ~ 1.0。
+  # limiter 峰值上限。
+  # 允許範圍：0.1 ~ 1.0
+  # 例：0.95 表示將峰值控制在約 95%。
   limiter_level: 0.95
 
 processing:
@@ -59,23 +85,59 @@ processing:
   # ----------------------------------------------------------
   # remove_bgm:
   #   適合原片有 BGM。
-  #   ELUATE 分離 Speech / SFX，Music 直接丟棄，再重建音訊。
-  #   缺點：若 ELUATE 把某些遊戲音效誤判為 Music，那些音效也可能被移除。
+  #   ELUATE 分離 Speech / SFX，Music 直接丟棄，再用 Speech + SFX 重建音訊。
+  #
+  #   Speech / SFX 都可設定 0.0 ~ 3.0。
+  #
+  #   缺點：
+  #   若 ELUATE 把某些遊戲音效誤判為 Music，
+  #   那些音效也可能隨 Music 一起被移除。
   #
   # no_bgm:
-  #   適合你已確定原片沒有 BGM，只想調整人聲 / 音效。
-  #   不用 Speech + SFX 重建整條音訊，而是保留原始音訊 1.0x，
-  #   再額外疊加需要增加的 Speech / SFX stem。
+  #   適合已確定原片沒有 BGM，只想調整人聲 / 音效。
   #
-  #   例：speech=1.0, sfx=1.5
+  #   此模式不直接用 Speech + SFX 重建整條音訊，
+  #   而是保留原始音訊，再依目標倍率加入或扣除 stem：
+  #
+  #       output =
+  #           original
+  #           + speech * (speech_volume - 1.0)
+  #           + sfx    * (sfx_volume - 1.0)
+  #
+  #   範例 1：
+  #       speech_volume = 1.0
+  #       sfx_volume    = 1.5
+  #
   #       output = original + (sfx * 0.5)
   #
-  #   優點：即使某些 SFX 沒被 ELUATE 正確抓進 sfx stem，
-  #         它仍會留在 original 裡，不會像 remove_bgm 模式一樣被誤刪。
+  #       → 人聲維持約 100%，SFX 約 150%。
+  #
+  #   範例 2：
+  #       speech_volume = 0.5
+  #       sfx_volume    = 2.0
+  #
+  #       output = original - (speech * 0.5) + (sfx * 1.0)
+  #
+  #       → 人聲降到約 50%，SFX 提高到約 200%。
+  #
+  #   優點：
+  #   即使某些 SFX 沒有被 ELUATE 正確放進 sfx stem，
+  #   原始音訊仍然存在，因此不像 remove_bgm 模式那樣容易直接把聲音刪掉。
+  #
+  #   注意：
+  #   當 speech_volume 或 sfx_volume < 1.0 時，
+  #   程式會用反相 stem 從 original 扣除對應聲音。
+  #   由於 AI stem 不可能與原音完全一致，
+  #   有機會產生少量相位抵銷、殘音或金屬感。
+  #
+  #   當倍率提高到 2.0 ~ 3.0 時，
+  #   建議保持 limiter=true，以降低 clipping / 爆音風險。
   mode: "no_bgm"
 
   # true = 允許覆蓋既有輸出檔。
   overwrite: true
 
-  # true = 保留 ELUATE 產生的 speech / sfx WAV，方便檢查模型分類結果。
+  # true = 保留 ELUATE 產生的 speech / sfx WAV，
+  #        方便單獨播放並檢查模型分類結果。
+  # false = 處理完成後清除暫存 stems。
   keep_stems: false
