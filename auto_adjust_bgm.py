@@ -182,10 +182,8 @@ def load_yaml(path: Path) -> dict[str, Any]:
         import yaml
     except ImportError as exc:
         raise RuntimeError(
-            "缺少 PyYAML。請先安裝：\n"
-            "  python3 -m pip install -r requirements.txt\n"
-            "或：\n"
-            "  python3 -m pip install PyYAML"
+            "工具 venv 中缺少 PyYAML。正常情況 bootstrap 會自動安裝；"
+            "請重新執行本程式一次。"
         ) from exc
 
     if not path.exists():
@@ -428,8 +426,12 @@ def check_ffmpeg() -> str:
 
 
 # ============================================================
-# ELUATE dedicated venv
+# Runtime bootstrap / dedicated venv
 # ============================================================
+
+BOOTSTRAP_PACKAGE = "PyYAML"
+BOOTSTRAP_MODULE = "yaml"
+
 
 def get_venv_python() -> Path:
     if is_windows():
@@ -443,35 +445,103 @@ def get_venv_eluate() -> Path:
     return TOOL_VENV / "bin" / "eluate"
 
 
+def is_valid_venv_python(python_path: Path) -> bool:
+    """實際執行目標 Python，確認它確實是 TOOL_VENV 的 venv Python。"""
+    if not python_path.exists():
+        return False
+
+    code = (
+        "import json,sys; "
+        "print(json.dumps({'prefix': sys.prefix, 'base_prefix': sys.base_prefix}))"
+    )
+
+    result = subprocess.run(
+        [str(python_path), "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return False
+
+    try:
+        info = json.loads(result.stdout.strip().splitlines()[-1])
+        prefix = Path(info["prefix"]).expanduser().resolve()
+        base_prefix = Path(info["base_prefix"]).expanduser().resolve()
+        expected = TOOL_VENV.expanduser().resolve()
+    except Exception:
+        return False
+
+    return prefix == expected and prefix != base_prefix
+
+
+def is_running_in_tool_venv() -> bool:
+    try:
+        return Path(sys.prefix).expanduser().resolve() == TOOL_VENV.expanduser().resolve()
+    except Exception:
+        return False
+
+
 def install_python_venv_support_linux() -> None:
-    if not is_linux() or not shutil.which("apt-get"):
+    """Ubuntu / Debian 缺少 ensurepip/venv 時，自動用 apt 補齊。"""
+    if not is_linux():
         return
+
+    apt = shutil.which("apt-get")
+    if not apt:
+        raise RuntimeError(
+            "目前 Python 無法建立 venv，而且找不到 apt-get。\n"
+            "請先安裝對應的 python3-venv 套件。"
+        )
 
     major = sys.version_info.major
     minor = sys.version_info.minor
     version_pkg = f"python{major}.{minor}-venv"
     prefix = sudo_prefix()
-    apt = shutil.which("apt-get") or "apt-get"
 
+    print_info(f"嘗試自動安裝 {version_pkg}...")
     subprocess.check_call(prefix + [apt, "update"])
+
     result = subprocess.run(
-        prefix + [apt, "install", "-y", version_pkg], check=False
-    )
+        prefix + [apt, "install", "-y", version_pkg],
+        check=False,
+        )
+
     if result.returncode != 0:
+        print_warn(f"{version_pkg} 安裝失敗，改嘗試 python3-venv。")
         subprocess.check_call(prefix + [apt, "install", "-y", "python3-venv"])
 
 
-def ensure_tool_venv() -> Path:
-    python_path = get_venv_python()
-    if python_path.exists():
-        return python_path
+def ensure_pip(python_path: Path) -> None:
+    result = subprocess.run(
+        [str(python_path), "-m", "pip", "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
+    if result.returncode == 0:
+        return
+
+    print_warn("venv 中找不到 pip，嘗試使用 ensurepip 修復。")
+    subprocess.check_call([str(python_path), "-m", "ensurepip", "--upgrade"])
+
+
+def create_tool_venv() -> Path:
     TOOL_HOME.mkdir(parents=True, exist_ok=True)
-    print_info(f"建立 ELUATE 專用 venv：{TOOL_VENV}")
+    python_path = get_venv_python()
+
+    print_info(f"建立工具專用 Python venv：{TOOL_VENV}")
 
     result = subprocess.run(
-        [sys.executable, "-m", "venv", str(TOOL_VENV)], check=False
+        [sys.executable, "-m", "venv", str(TOOL_VENV)],
+        check=False,
     )
+
     if result.returncode != 0:
         if is_linux():
             install_python_venv_support_linux()
@@ -479,23 +549,51 @@ def ensure_tool_venv() -> Path:
                 [sys.executable, "-m", "venv", str(TOOL_VENV)]
             )
         else:
-            raise RuntimeError("建立 ELUATE 專用 venv 失敗。")
+            raise RuntimeError("建立工具專用 Python venv 失敗。")
 
-    if not python_path.exists():
-        raise RuntimeError(f"建立 venv 後仍找不到 Python：{python_path}")
+    if not is_valid_venv_python(python_path):
+        raise RuntimeError(
+            "Python venv 建立完成後仍無法通過驗證：\n"
+            f"{TOOL_VENV}"
+        )
 
-    print_ok(f"ELUATE 專用 venv 已建立：{TOOL_VENV}")
+    ensure_pip(python_path)
+    print_ok(f"工具專用 venv 已建立：{TOOL_VENV}")
     return python_path
 
 
+def ensure_tool_venv() -> Path:
+    """
+    確保 TOOL_VENV 是真正有效的 venv。
+
+    舊版只看 bin/python 是否存在，可能留下壞掉或曾被移動的環境，
+    最後導致 pip 誤判成系統 Python並觸發 PEP 668。
+    """
+    python_path = get_venv_python()
+
+    if is_valid_venv_python(python_path):
+        ensure_pip(python_path)
+        return python_path
+
+    if TOOL_VENV.exists():
+        if is_running_in_tool_venv():
+            raise RuntimeError(
+                "目前正在一個無效的工具 venv 中執行，無法安全自我刪除。\n"
+                "請離開該 shell 後，再使用系統 python3 執行本程式一次。"
+            )
+
+        print_warn(
+            "偵測到損壞、被移動或不是有效 venv 的舊環境，將自動重建：\n"
+            f"{TOOL_VENV}"
+        )
+        shutil.rmtree(TOOL_VENV, ignore_errors=False)
+
+    return create_tool_venv()
+
+
 def module_importable(python_executable: str | Path, module_name: str) -> bool:
-    """檢查指定 Python 環境是否能實際 import 某個 module。"""
     result = subprocess.run(
-        [
-            str(python_executable),
-            "-c",
-            f"import {module_name}",
-        ],
+        [str(python_executable), "-c", f"import {module_name}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -503,30 +601,92 @@ def module_importable(python_executable: str | Path, module_name: str) -> bool:
     return result.returncode == 0
 
 
+def run_pip(python_path: Path, *args: str) -> None:
+    """所有 pip 安裝都強制透過已驗證的 venv Python 執行。"""
+    if not is_valid_venv_python(python_path):
+        raise RuntimeError(
+            "拒絕執行 pip：目標 Python 不是有效的工具 venv。\n"
+            f"{python_path}"
+        )
+
+    ensure_pip(python_path)
+    subprocess.check_call([str(python_path), "-m", "pip", *args])
+
+
 def upgrade_tooling(python_path: Path) -> None:
-    print_info("更新 ELUATE venv 的 pip / setuptools / wheel...")
-    subprocess.check_call(
-        [
-            str(python_path), "-m", "pip", "install", "--upgrade",
-            "pip", "setuptools", "wheel",
-        ]
+    print_info("更新工具 venv 的 pip / setuptools / wheel...")
+    run_pip(
+        python_path,
+        "install",
+        "--upgrade",
+        "pip",
+        "setuptools",
+        "wheel",
     )
 
 
-def install_eluate() -> str:
+def ensure_bootstrap_packages(python_path: Path) -> None:
+    """只安裝讀 YAML 所需的最小依賴，ELUATE/PyTorch 等讀完設定再處理。"""
+    if module_importable(python_path, BOOTSTRAP_MODULE):
+        return
+
+    print_info(f"安裝啟動必要套件：{BOOTSTRAP_PACKAGE}")
+    run_pip(
+        python_path,
+        "install",
+        "--upgrade",
+        BOOTSTRAP_PACKAGE,
+    )
+
+    if not module_importable(python_path, BOOTSTRAP_MODULE):
+        raise RuntimeError(
+            f"{BOOTSTRAP_PACKAGE} 安裝完成後仍無法 import {BOOTSTRAP_MODULE}。"
+        )
+
+
+def bootstrap_runtime() -> None:
+    """
+    讓 Git clone 後可以直接執行：
+        python3 auto_adjust_bgm.py
+
+    第一次執行：
+      1. 建立 / 修復 ~/.auto_remove_bgm/venv
+      2. 安裝 PyYAML
+      3. 使用該 venv Python 重新啟動本程式
+
+    重新啟動後才讀 YAML，再依 device 安裝/修復 ELUATE 與 PyTorch。
+    """
+    validate_platform()
+
+    python_path = ensure_tool_venv()
+    ensure_bootstrap_packages(python_path)
+
+    if is_running_in_tool_venv():
+        return
+
+    print_info(f"切換到工具專用 Python：{python_path}")
+    os.execv(
+        str(python_path),
+        [
+            str(python_path),
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ],
+    )
+
+
+def install_eluate(requested_device: str | None = None) -> str:
     python_path = ensure_tool_venv()
     upgrade_tooling(python_path)
 
-    print_info("開始安裝 / 更新 ELUATE...")
-    subprocess.check_call(
-        [
-            str(python_path),
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            ELUATE_PACKAGE,
-        ]
+    package_spec = "eluate[cpu]" if requested_device == "cpu" else ELUATE_PACKAGE
+
+    print_info(f"開始安裝 / 更新 ELUATE：{package_spec}")
+    run_pip(
+        python_path,
+        "install",
+        "--upgrade",
+        package_spec,
     )
 
     eluate = get_venv_eluate()
@@ -538,102 +698,82 @@ def install_eluate() -> str:
 
 
 def install_pytorch(python_path: Path, requested_device: str | None) -> None:
-    """
-    將 PyTorch 安裝到 ELUATE 的專用 venv。
+    """修復極端情況：ELUATE 已存在，但 torch / torchaudio 不完整。"""
+    print_warn("ELUATE 專用環境缺少可用的 PyTorch / torchaudio。")
 
-    注意：
-    - Linux / WSL + NVIDIA：一般 PyPI 的 torch 會依目前發行方式安裝對應套件。
-    - macOS Apple Silicon：一般 PyPI torch 提供 MPS 支援。
-    - Intel Mac：新版 torch 可能已無相容 wheel，安裝失敗時會給明確提示。
-    """
-    print_warn("ELUATE 專用環境缺少可用的 PyTorch。")
-    print_info("開始安裝 / 更新 PyTorch...")
-
-    command = [
-        str(python_path),
-        "-m",
-        "pip",
-        "install",
-        "--upgrade",
-        "torch",
-    ]
+    if requested_device == "cpu":
+        print_info("重新安裝 CPU 模式 ELUATE 依賴...")
+        package_args = ["eluate[cpu]"]
+    else:
+        print_info("開始安裝 / 更新 PyTorch 與 torchaudio...")
+        package_args = ["torch", "torchaudio"]
 
     try:
-        subprocess.check_call(command)
+        run_pip(
+            python_path,
+            "install",
+            "--upgrade",
+            *package_args,
+        )
     except subprocess.CalledProcessError as exc:
         if is_macos() and platform.machine().lower() in {"x86_64", "amd64"}:
             raise RuntimeError(
-                "PyTorch 安裝失敗。這台是 Intel Mac；新版 PyTorch 可能已沒有 "
-                "相容的 macOS x86_64 wheel。可考慮使用較舊且相容的 PyTorch / Python，"
-                "或改在較新的 Apple Silicon Mac、Linux / WSL 執行。"
+                "PyTorch 安裝失敗。這台是 Intel Mac；目前新版 PyTorch 對 macOS "
+                "x86_64 的 wheel 支援有限。可能需要使用較舊且相容的 Python / "
+                "PyTorch，或改在 Linux / WSL / Apple Silicon Mac 執行。"
             ) from exc
 
         raise RuntimeError(
-            "PyTorch 自動安裝失敗。請先確認網路、Python 版本與平台相容性，"
-            "再手動於 ELUATE venv 安裝 torch：\n"
-            f"  {python_path} -m pip install --upgrade torch"
+            "PyTorch 自動安裝失敗。工具 venv 已經是隔離環境，因此不應使用 "
+            "--break-system-packages。請檢查網路、Python 版本與 PyTorch wheel 相容性。\n"
+            f"venv Python：{python_path}"
         ) from exc
 
     if not module_importable(python_path, "torch"):
-        raise RuntimeError(
-            "PyTorch 安裝指令已完成，但 ELUATE venv 仍無法 import torch。\n"
-            f"請檢查：{python_path} -m pip show torch"
-        )
+        raise RuntimeError("安裝完成後仍無法 import torch。")
+    if not module_importable(python_path, "torchaudio"):
+        raise RuntimeError("安裝完成後仍無法 import torchaudio。")
 
-    print_ok("PyTorch 已安裝到 ELUATE 專用 venv。")
-
-    # 提前做一次裝置提示；正式驗證仍由 show_device_status() 負責。
-    status = get_torch_status(str(python_path))
-    if requested_device == "cuda" and not status.get("cuda_available"):
-        print_warn(
-            "PyTorch 已安裝，但目前尚未偵測到 CUDA。"
-            "若你指定 device=cuda，稍後的裝置檢查會阻止繼續執行。"
-        )
-    elif requested_device == "mps" and not status.get("mps_available"):
-        print_warn(
-            "PyTorch 已安裝，但目前尚未偵測到 MPS。"
-            "若你指定 device=mps，稍後的裝置檢查會阻止繼續執行。"
-        )
+    print_ok("PyTorch / torchaudio 已就緒。")
 
 
 def ensure_eluate(requested_device: str | None = None) -> str:
     """
-    確保 ELUATE 專用 venv 完整可用。
-
-    不能只判斷 eluate CLI 是否存在，因為舊環境可能出現：
-        eluate 存在，但 torch 不存在 / 已損壞。
-
-    因此這裡會依序確保：
-        1. venv 存在
-        2. ELUATE CLI 存在
-        3. PyTorch 可 import
-        4. ELUATE Python package 可 import
+    自動修復 ELUATE runtime：
+      - venv 無效 -> 自動重建
+      - ELUATE 不存在 -> 安裝
+      - torch / torchaudio 遺失 -> 自動補裝
+      - eluate import 失敗 -> 嘗試更新 ELUATE
     """
     python_path = ensure_tool_venv()
     eluate = get_venv_eluate()
 
     if not eluate.exists():
         print_warn("找不到 ELUATE CLI，準備安裝。")
-        install_eluate()
+        install_eluate(requested_device)
         eluate = get_venv_eluate()
 
-    # ELUATE 的 Python API 需要 torch；先修 torch，再驗證 eluate import。
-    if not module_importable(python_path, "torch"):
+    if not module_importable(python_path, "torch") or not module_importable(
+            python_path, "torchaudio"
+    ):
         install_pytorch(python_path, requested_device)
 
     if not module_importable(python_path, "eluate"):
-        print_warn("ELUATE CLI 存在，但 Python package 無法載入，嘗試重新安裝。")
-        install_eluate()
+        print_warn("ELUATE package 無法載入，嘗試更新 / 修復 ELUATE。")
+        install_eluate(requested_device)
 
-        if not module_importable(python_path, "eluate"):
-            raise RuntimeError(
-                "重新安裝後仍無法在 ELUATE venv 中 import eluate。\n"
-                f"請檢查：{python_path} -m pip check"
-            )
+    missing = [
+        module
+        for module in ("torch", "torchaudio", "eluate")
+        if not module_importable(python_path, module)
+    ]
 
-    # 再確認一次 torch，避免 ELUATE 重裝過程改變依賴狀態。
-    if not module_importable(python_path, "torch"):
-        install_pytorch(python_path, requested_device)
+    if missing:
+        raise RuntimeError(
+            "ELUATE runtime 修復後仍有模組無法載入："
+            + ", ".join(missing)
+            + "\n可嘗試刪除 ~/.auto_remove_bgm/venv 後重新執行本程式。"
+        )
 
     print_ok(f"ELUATE 專用環境就緒：{eluate}")
     return str(eluate)
@@ -647,18 +787,22 @@ def ensure_checkpoint(eluate_path: str, checkpoint: str) -> None:
     print_warn(f"找不到 checkpoint：{model_path}")
     print_info("執行 eluate setup 下載模型...")
 
-    # ELUATE setup 預設主要準備 multi；其他 checkpoint 仍可能在首次使用時下載。
     result = subprocess.run([eluate_path, "setup"])
     if result.returncode != 0:
         raise RuntimeError(f"eluate setup 失敗，exit code = {result.returncode}")
 
+    if checkpoint == "multi" and not model_path.exists():
+        raise RuntimeError(
+            "eluate setup 執行完成，但仍找不到 multi checkpoint：\n"
+            f"{model_path}"
+        )
+
 
 def python_for_eluate(eluate_path: str) -> str:
-    eluate = Path(eluate_path).resolve()
-    candidate = eluate.parent / ("python.exe" if is_windows() else "python")
-    if candidate.exists():
-        return str(candidate)
-    raise RuntimeError(f"無法找到 ELUATE 所屬 Python：{eluate}")
+    python_path = get_venv_python()
+    if is_valid_venv_python(python_path):
+        return str(python_path)
+    raise RuntimeError(f"ELUATE 專用 Python venv 無效：{TOOL_VENV}")
 
 
 # ============================================================
@@ -869,12 +1013,12 @@ metadata_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-
 
 
 def extract_stems(
-    eluate_path: str,
-    input_path: Path,
-    work_dir: Path,
-    checkpoint: str,
-    device: str | None,
-    force: bool,
+        eluate_path: str,
+        input_path: Path,
+        work_dir: Path,
+        checkpoint: str,
+        device: str | None,
+        force: bool,
 ) -> tuple[Path, Path, dict[str, Any]]:
     eluate_python = python_for_eluate(eluate_path)
     metadata_path = work_dir / "eluate_result.json"
@@ -894,7 +1038,7 @@ def extract_stems(
         checkpoint,
         device or "auto",
         "1" if force else "0",
-    ]
+        ]
 
     process = subprocess.run(command)
     if process.returncode != 0:
@@ -929,10 +1073,10 @@ def extract_stems(
 # ============================================================
 
 def build_audio_filter(
-    speech_volume: float,
-    sfx_volume: float,
-    limiter: bool,
-    limiter_level: float,
+        speech_volume: float,
+        sfx_volume: float,
+        limiter: bool,
+        limiter_level: float,
 ) -> str:
     parts = [
         f"[1:a]volume={speech_volume}[speech]",
@@ -949,19 +1093,19 @@ def build_audio_filter(
 
 
 def mux_adjusted_audio(
-    ffmpeg: str,
-    input_path: Path,
-    speech_path: Path,
-    sfx_path: Path,
-    output_path: Path,
-    *,
-    speech_volume: float,
-    sfx_volume: float,
-    audio_codec: str,
-    audio_bitrate: str | None,
-    limiter: bool,
-    limiter_level: float,
-    overwrite: bool,
+        ffmpeg: str,
+        input_path: Path,
+        speech_path: Path,
+        sfx_path: Path,
+        output_path: Path,
+        *,
+        speech_volume: float,
+        sfx_volume: float,
+        audio_codec: str,
+        audio_bitrate: str | None,
+        limiter: bool,
+        limiter_level: float,
+        overwrite: bool,
 ) -> None:
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -1192,4 +1336,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:
+        bootstrap_runtime()
+    except KeyboardInterrupt:
+        print_error("使用者取消初始化。")
+        sys.exit(130)
+    except Exception as exc:
+        print_header("初始化失敗")
+        print_error(f"{type(exc).__name__}: {exc}")
+        sys.exit(1)
+
     sys.exit(main())
