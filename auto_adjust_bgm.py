@@ -488,9 +488,22 @@ def ensure_tool_venv() -> Path:
     return python_path
 
 
-def install_eluate() -> str:
-    python_path = ensure_tool_venv()
+def module_importable(python_executable: str | Path, module_name: str) -> bool:
+    """檢查指定 Python 環境是否能實際 import 某個 module。"""
+    result = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            f"import {module_name}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
 
+
+def upgrade_tooling(python_path: Path) -> None:
     print_info("更新 ELUATE venv 的 pip / setuptools / wheel...")
     subprocess.check_call(
         [
@@ -499,9 +512,21 @@ def install_eluate() -> str:
         ]
     )
 
-    print_info("開始安裝 ELUATE...")
+
+def install_eluate() -> str:
+    python_path = ensure_tool_venv()
+    upgrade_tooling(python_path)
+
+    print_info("開始安裝 / 更新 ELUATE...")
     subprocess.check_call(
-        [str(python_path), "-m", "pip", "install", "--upgrade", ELUATE_PACKAGE]
+        [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            ELUATE_PACKAGE,
+        ]
     )
 
     eluate = get_venv_eluate()
@@ -512,11 +537,106 @@ def install_eluate() -> str:
     return str(eluate)
 
 
-def ensure_eluate() -> str:
-    managed = get_venv_eluate()
-    if managed.exists():
-        return str(managed)
-    return install_eluate()
+def install_pytorch(python_path: Path, requested_device: str | None) -> None:
+    """
+    將 PyTorch 安裝到 ELUATE 的專用 venv。
+
+    注意：
+    - Linux / WSL + NVIDIA：一般 PyPI 的 torch 會依目前發行方式安裝對應套件。
+    - macOS Apple Silicon：一般 PyPI torch 提供 MPS 支援。
+    - Intel Mac：新版 torch 可能已無相容 wheel，安裝失敗時會給明確提示。
+    """
+    print_warn("ELUATE 專用環境缺少可用的 PyTorch。")
+    print_info("開始安裝 / 更新 PyTorch...")
+
+    command = [
+        str(python_path),
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "torch",
+    ]
+
+    try:
+        subprocess.check_call(command)
+    except subprocess.CalledProcessError as exc:
+        if is_macos() and platform.machine().lower() in {"x86_64", "amd64"}:
+            raise RuntimeError(
+                "PyTorch 安裝失敗。這台是 Intel Mac；新版 PyTorch 可能已沒有 "
+                "相容的 macOS x86_64 wheel。可考慮使用較舊且相容的 PyTorch / Python，"
+                "或改在較新的 Apple Silicon Mac、Linux / WSL 執行。"
+            ) from exc
+
+        raise RuntimeError(
+            "PyTorch 自動安裝失敗。請先確認網路、Python 版本與平台相容性，"
+            "再手動於 ELUATE venv 安裝 torch：\n"
+            f"  {python_path} -m pip install --upgrade torch"
+        ) from exc
+
+    if not module_importable(python_path, "torch"):
+        raise RuntimeError(
+            "PyTorch 安裝指令已完成，但 ELUATE venv 仍無法 import torch。\n"
+            f"請檢查：{python_path} -m pip show torch"
+        )
+
+    print_ok("PyTorch 已安裝到 ELUATE 專用 venv。")
+
+    # 提前做一次裝置提示；正式驗證仍由 show_device_status() 負責。
+    status = get_torch_status(str(python_path))
+    if requested_device == "cuda" and not status.get("cuda_available"):
+        print_warn(
+            "PyTorch 已安裝，但目前尚未偵測到 CUDA。"
+            "若你指定 device=cuda，稍後的裝置檢查會阻止繼續執行。"
+        )
+    elif requested_device == "mps" and not status.get("mps_available"):
+        print_warn(
+            "PyTorch 已安裝，但目前尚未偵測到 MPS。"
+            "若你指定 device=mps，稍後的裝置檢查會阻止繼續執行。"
+        )
+
+
+def ensure_eluate(requested_device: str | None = None) -> str:
+    """
+    確保 ELUATE 專用 venv 完整可用。
+
+    不能只判斷 eluate CLI 是否存在，因為舊環境可能出現：
+        eluate 存在，但 torch 不存在 / 已損壞。
+
+    因此這裡會依序確保：
+        1. venv 存在
+        2. ELUATE CLI 存在
+        3. PyTorch 可 import
+        4. ELUATE Python package 可 import
+    """
+    python_path = ensure_tool_venv()
+    eluate = get_venv_eluate()
+
+    if not eluate.exists():
+        print_warn("找不到 ELUATE CLI，準備安裝。")
+        install_eluate()
+        eluate = get_venv_eluate()
+
+    # ELUATE 的 Python API 需要 torch；先修 torch，再驗證 eluate import。
+    if not module_importable(python_path, "torch"):
+        install_pytorch(python_path, requested_device)
+
+    if not module_importable(python_path, "eluate"):
+        print_warn("ELUATE CLI 存在，但 Python package 無法載入，嘗試重新安裝。")
+        install_eluate()
+
+        if not module_importable(python_path, "eluate"):
+            raise RuntimeError(
+                "重新安裝後仍無法在 ELUATE venv 中 import eluate。\n"
+                f"請檢查：{python_path} -m pip check"
+            )
+
+    # 再確認一次 torch，避免 ELUATE 重裝過程改變依賴狀態。
+    if not module_importable(python_path, "torch"):
+        install_pytorch(python_path, requested_device)
+
+    print_ok(f"ELUATE 專用環境就緒：{eluate}")
+    return str(eluate)
 
 
 def ensure_checkpoint(eluate_path: str, checkpoint: str) -> None:
@@ -749,12 +869,12 @@ metadata_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-
 
 
 def extract_stems(
-        eluate_path: str,
-        input_path: Path,
-        work_dir: Path,
-        checkpoint: str,
-        device: str | None,
-        force: bool,
+    eluate_path: str,
+    input_path: Path,
+    work_dir: Path,
+    checkpoint: str,
+    device: str | None,
+    force: bool,
 ) -> tuple[Path, Path, dict[str, Any]]:
     eluate_python = python_for_eluate(eluate_path)
     metadata_path = work_dir / "eluate_result.json"
@@ -774,7 +894,7 @@ def extract_stems(
         checkpoint,
         device or "auto",
         "1" if force else "0",
-        ]
+    ]
 
     process = subprocess.run(command)
     if process.returncode != 0:
@@ -809,10 +929,10 @@ def extract_stems(
 # ============================================================
 
 def build_audio_filter(
-        speech_volume: float,
-        sfx_volume: float,
-        limiter: bool,
-        limiter_level: float,
+    speech_volume: float,
+    sfx_volume: float,
+    limiter: bool,
+    limiter_level: float,
 ) -> str:
     parts = [
         f"[1:a]volume={speech_volume}[speech]",
@@ -829,19 +949,19 @@ def build_audio_filter(
 
 
 def mux_adjusted_audio(
-        ffmpeg: str,
-        input_path: Path,
-        speech_path: Path,
-        sfx_path: Path,
-        output_path: Path,
-        *,
-        speech_volume: float,
-        sfx_volume: float,
-        audio_codec: str,
-        audio_bitrate: str | None,
-        limiter: bool,
-        limiter_level: float,
-        overwrite: bool,
+    ffmpeg: str,
+    input_path: Path,
+    speech_path: Path,
+    sfx_path: Path,
+    output_path: Path,
+    *,
+    speech_volume: float,
+    sfx_volume: float,
+    audio_codec: str,
+    audio_bitrate: str | None,
+    limiter: bool,
+    limiter_level: float,
+    overwrite: bool,
 ) -> None:
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -933,7 +1053,7 @@ def process_video(config: dict[str, Any]) -> Path:
     ffmpeg = check_ffmpeg()
 
     print_info("檢查 ELUATE...")
-    eluate = ensure_eluate()
+    eluate = ensure_eluate(eluate_cfg["device"])
     print_ok(f"ELUATE：{eluate}")
 
     ensure_checkpoint(eluate, eluate_cfg["checkpoint"])
