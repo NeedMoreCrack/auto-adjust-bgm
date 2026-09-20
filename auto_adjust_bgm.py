@@ -36,8 +36,8 @@ auto_adjust_bgm.py
     - 支援 CUDA / MPS / CPU 狀態檢查
     - Windows 原生環境主動阻擋，建議使用 WSL2
     - 避免誤用全域 ELUATE
-    - ELUATE / checkpoint 錯誤提供較清楚的診斷
     - 使用暫存輸出檔，成功後才覆蓋正式輸出
+    - 保留 ELUATE 原生 Terminal / Rich 進度顯示
 """
 
 from __future__ import annotations
@@ -165,18 +165,12 @@ def show_platform_info() -> None:
                 "新版 PyTorch 對 Intel macOS 的官方 binary 支援有限，"
                 "可能只能使用較舊 PyTorch 或 CPU。"
             )
+
         elif arch in ("arm64", "aarch64"):
             print_ok("偵測到 Apple Silicon Mac")
 
 
 def validate_platform() -> None:
-    """
-    ELUATE 現行實作包含 Unix-only 的 resource 模組，
-    因此 Windows 原生容易直接失敗。
-
-    Windows 使用者建議改用 WSL2。
-    """
-
     if is_windows():
         raise RuntimeError(
             "目前不建議在 Windows 原生環境執行 ELUATE。\n\n"
@@ -402,7 +396,6 @@ def install_ffmpeg_macos() -> None:
 def add_executable_dir_to_path(
         executable: str,
 ) -> None:
-
     exe_dir = str(
         Path(executable)
         .resolve()
@@ -431,7 +424,6 @@ def add_executable_dir_to_path(
 def find_ffmpeg(
         auto_install: bool = True,
 ) -> str:
-
     ffmpeg = shutil.which(
         "ffmpeg"
     )
@@ -682,7 +674,6 @@ def ensure_tool_venv() -> Path:
     )
 
     if result.returncode != 0:
-
         if is_linux():
             install_python_venv_support_linux()
 
@@ -715,17 +706,6 @@ def ensure_tool_venv() -> Path:
 
 
 def find_eluate() -> str | None:
-    """
-    只允許使用本工具自己管理的 ELUATE。
-
-    不使用 shutil.which("eluate") fallback，
-    避免誤吃：
-        - 系統 Python
-        - global pip
-        - 其他專案 venv
-        - 不同 torch/CUDA 環境
-    """
-
     managed = (
         get_venv_eluate()
     )
@@ -814,7 +794,6 @@ def ensure_eluate() -> str:
 def python_for_eluate(
         eluate_path: str,
 ) -> str:
-
     eluate = (
         Path(eluate_path)
         .resolve()
@@ -825,6 +804,7 @@ def python_for_eluate(
                 eluate.parent
                 / "python.exe"
         )
+
     else:
         candidate = (
                 eluate.parent
@@ -843,7 +823,6 @@ def python_for_eluate(
 def get_torch_status(
         python_executable: str,
 ) -> dict:
-
     code = r'''
 import json
 
@@ -872,21 +851,6 @@ try:
         except Exception:
             pass
 
-    mps_name = None
-
-    if mps_available:
-        try:
-            get_name = getattr(
-                torch.backends.mps,
-                "get_name",
-                None
-            )
-
-            if callable(get_name):
-                mps_name = get_name()
-        except Exception:
-            pass
-
     data = {
         "torch_installed": True,
         "torch_version": torch.__version__,
@@ -895,11 +859,9 @@ try:
         "cuda_device_name": cuda_name,
         "mps_built": mps_built,
         "mps_available": mps_available,
-        "mps_device_name": mps_name,
     }
 
 except Exception as e:
-
     data = {
         "torch_installed": False,
         "error": f"{type(e).__name__}: {e}",
@@ -961,7 +923,6 @@ def show_device_status(
         eluate_path: str,
         requested_device: str | None = None,
 ) -> dict:
-
     python_executable = (
         python_for_eluate(
             eluate_path
@@ -1028,16 +989,8 @@ def show_device_status(
         )
 
     if mps_available:
-        name = (
-                status.get(
-                    "mps_device_name"
-                )
-                or
-                "Apple Metal GPU"
-        )
-
         print_ok(
-            f"MPS 可用：{name}"
+            "MPS 可用：Apple Metal GPU"
         )
 
     elif is_macos():
@@ -1048,13 +1001,13 @@ def show_device_status(
                 "PyTorch 包含 MPS 支援，"
                 "但目前裝置無法使用 MPS。"
             )
+
         else:
             print_warn(
                 "目前 PyTorch 沒有 MPS backend。"
             )
 
     if requested_device == "cuda":
-
         if not cuda_available:
             raise RuntimeError(
                 "你指定了 --device cuda，"
@@ -1063,7 +1016,6 @@ def show_device_status(
             )
 
     if requested_device == "mps":
-
         if not mps_available:
             raise RuntimeError(
                 "你指定了 --device mps，"
@@ -1077,7 +1029,6 @@ def show_device_status(
         )
 
     if requested_device is None:
-
         if cuda_available:
             print_info(
                 "建議運算裝置：CUDA"
@@ -1104,7 +1055,6 @@ def show_device_status(
 def validate_input(
         input_path: Path,
 ) -> Path:
-
     input_path = (
         input_path
         .expanduser()
@@ -1147,13 +1097,13 @@ def create_output_path(
         input_path: Path,
         output_path: str | None,
 ) -> Path:
-
     if output_path:
         output = (
             Path(output_path)
             .expanduser()
             .resolve()
         )
+
     else:
         output = (
             input_path.with_name(
@@ -1179,7 +1129,6 @@ def create_output_path(
 def create_temp_output_path(
         output_path: Path,
 ) -> Path:
-
     return (
         output_path.with_name(
             f"{output_path.stem}"
@@ -1196,11 +1145,12 @@ def create_temp_output_path(
 def print_checkpoint_repair_hint(
         checkpoint: str,
 ) -> None:
-
     print()
+
     print_warn(
-        "ELUATE checkpoint "
-        "可能下載不完整或 SHA256 不符。"
+        "若上方 ELUATE 錯誤訊息包含 "
+        "checkpoint / SHA256 mismatch，"
+        "可以刪除模型後重新下載。"
     )
 
     model_path = (
@@ -1209,7 +1159,7 @@ def print_checkpoint_repair_hint(
     )
 
     print_info(
-        "可以嘗試刪除模型後重新下載："
+        "修復指令："
     )
 
     print()
@@ -1234,7 +1184,6 @@ def remove_bgm(
         device: str | None = None,
         force: bool = False,
 ) -> None:
-
     temp_output = (
         create_temp_output_path(
             output_path
@@ -1295,76 +1244,28 @@ def remove_bgm(
 
     print()
 
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
+    # 重要：
+    # 不捕捉 stdout/stderr，
+    # 讓 ELUATE 直接連目前 Terminal，
+    # 保留 Rich / tqdm / 原生進度條。
+    process = subprocess.run(
+        command
     )
 
-    collected_lines: list[str] = []
-
-    assert process.stdout is not None
-
-    for line in process.stdout:
-        print(
-            line,
-            end="",
-        )
-
-        collected_lines.append(
-            line
-        )
-
-        if len(collected_lines) > 300:
-            collected_lines.pop(0)
-
-    return_code = (
-        process.wait()
-    )
-
-    output_text = (
-        "".join(
-            collected_lines
-        )
-    )
-
-    if return_code != 0:
-
+    if process.returncode != 0:
         if temp_output.exists():
             try:
                 temp_output.unlink()
             except OSError:
                 pass
 
-        lower_output = (
-            output_text.lower()
+        print_checkpoint_repair_hint(
+            checkpoint
         )
-
-        if (
-                "sha256 mismatch"
-                in lower_output
-                or
-                "checkpoint integrity check failed"
-                in lower_output
-                or
-                "checkpoint verification failed"
-                in lower_output
-        ):
-            print_checkpoint_repair_hint(
-                checkpoint
-            )
-
-            raise RuntimeError(
-                "ELUATE checkpoint 驗證失敗。"
-            )
 
         raise RuntimeError(
             "ELUATE 執行失敗，"
-            f"exit code = {return_code}"
+            f"exit code = {process.returncode}"
         )
 
     if not temp_output.exists():
@@ -1395,7 +1296,6 @@ def remove_bgm(
 def format_size(
         size: int,
 ) -> str:
-
     units = [
         "B",
         "KB",
@@ -1407,7 +1307,6 @@ def format_size(
     value = float(size)
 
     for unit in units:
-
         if value < 1024:
             return (
                 f"{value:.2f} {unit}"
@@ -1431,7 +1330,6 @@ def process_video(
         device: str | None = None,
         force: bool = False,
 ) -> Path:
-
     print_header(
         "Remove Video BGM"
     )
@@ -1534,7 +1432,6 @@ def process_video(
 # ============================================================
 
 def create_parser() -> argparse.ArgumentParser:
-
     parser = argparse.ArgumentParser(
         description=(
             "使用 ELUATE / BandIt v2 "
@@ -1611,7 +1508,6 @@ def create_parser() -> argparse.ArgumentParser:
 # ============================================================
 
 def main() -> int:
-
     parser = (
         create_parser()
     )
@@ -1621,7 +1517,6 @@ def main() -> int:
     )
 
     try:
-
         process_video(
             input_file=args.input,
             output_file=args.output,
@@ -1633,7 +1528,6 @@ def main() -> int:
         return 0
 
     except KeyboardInterrupt:
-
         print()
 
         print_error(
@@ -1643,7 +1537,6 @@ def main() -> int:
         return 130
 
     except Exception as e:
-
         print()
 
         print_header(
@@ -1657,7 +1550,6 @@ def main() -> int:
         print()
 
         import traceback
-
         traceback.print_exc()
 
         return 1
