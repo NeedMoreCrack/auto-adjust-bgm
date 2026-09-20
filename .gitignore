@@ -1,0 +1,117 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# PyCharm / IDE
+# =========================
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# =========================
+# Python build / package
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+# Test / Cache
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+temp_*/
+*.tmp
+
+# =========================
+# AI / ML model files
+# =========================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+checkpoints/
+models/
+weights/
+
+# =========================
+# Audio temporary files
+# =========================
+*.wav
+*.flac
+*.aac
+*.m4a
+*.mp3
+
+# =========================
+# Video files
+# 避免影片被 commit
+# =========================
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m4v
+*.mpeg
+*.mpg
+*.ts
+*.mts
+*.m2ts
+
+# =========================
+# Project output
+# =========================
+output/
+outputs/
+result/
+results/
+
+*_no_bgm.*
+*_processed.*
+*_clean.*
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+!.env.example
