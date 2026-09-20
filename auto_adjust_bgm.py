@@ -73,6 +73,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "limiter_level": 0.95,
     },
     "processing": {
+        "mode": "remove_bgm",
         "overwrite": True,
         "keep_stems": False,
     },
@@ -268,6 +269,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("eluate.force 必須是 true / false。")
     if not isinstance(audio.get("limiter", True), bool):
         raise ValueError("audio.limiter 必須是 true / false。")
+    mode = str(processing.get("mode", "remove_bgm")).strip().lower()
+    if mode not in {"remove_bgm", "no_bgm"}:
+        raise ValueError(
+            "processing.mode 只能是 remove_bgm 或 no_bgm。"
+        )
+    processing["mode"] = mode
+
+    if mode == "no_bgm":
+        if audio["speech_volume"] < 1.0 or audio["sfx_volume"] < 1.0:
+            raise ValueError(
+                "processing.mode=no_bgm 採用『保留原音 + 疊加增益 stem』策略，"
+                "因此 speech_volume / sfx_volume 必須 >= 1.0。"
+            )
+
     if not isinstance(processing.get("overwrite", True), bool):
         raise ValueError("processing.overwrite 必須是 true / false。")
     if not isinstance(processing.get("keep_stems", False), bool):
@@ -317,6 +332,8 @@ def build_config(args: argparse.Namespace) -> tuple[dict[str, Any], Path | None]
         config["audio"]["limiter"] = args.limiter
     if args.overwrite is not None:
         config["processing"]["overwrite"] = args.overwrite
+    if args.mode is not None:
+        config["processing"]["mode"] = args.mode
     if args.keep_stems is not None:
         config["processing"]["keep_stems"] = args.keep_stems
 
@@ -923,12 +940,17 @@ def validate_input(path_text: str) -> Path:
     return input_path
 
 
-def create_output_path(input_path: Path, output_text: str | None) -> Path:
+def create_output_path(
+        input_path: Path,
+        output_text: str | None,
+        mode: str,
+) -> Path:
     if output_text:
         output = Path(output_text).expanduser().resolve()
     else:
+        suffix = "_no_bgm" if mode == "remove_bgm" else "_audio_adjusted"
         output = input_path.with_name(
-            f"{input_path.stem}_no_bgm{input_path.suffix}"
+            f"{input_path.stem}{suffix}{input_path.suffix}"
         )
 
     if output == input_path:
@@ -1072,7 +1094,7 @@ def extract_stems(
 # FFmpeg mix / mux
 # ============================================================
 
-def build_audio_filter(
+def build_remove_bgm_filter(
         speech_volume: float,
         sfx_volume: float,
         limiter: bool,
@@ -1092,6 +1114,55 @@ def build_audio_filter(
     return ";".join(parts)
 
 
+def build_no_bgm_filter(
+        speech_volume: float,
+        sfx_volume: float,
+        limiter: bool,
+        limiter_level: float,
+) -> str:
+    """
+    no_bgm 模式不重建整條音訊，而是保留原音，再只疊加需要增加的 stem。
+
+    例如：
+        speech_volume = 1.0
+        sfx_volume = 1.5
+
+    實際為：
+        original + (sfx * 0.5)
+
+    好處是即使 ELUATE 把某些 SFX 誤判成 Music / 未抓進 sfx stem，
+    原始音訊中的那些聲音仍會維持 1.0x，不會被誤刪。
+    """
+    speech_delta = speech_volume - 1.0
+    sfx_delta = sfx_volume - 1.0
+
+    parts = ["[0:a]anull[original]"]
+    mix_inputs = ["[original]"]
+
+    if speech_delta > 0:
+        parts.append(f"[1:a]volume={speech_delta}[speech_delta]")
+        mix_inputs.append("[speech_delta]")
+
+    if sfx_delta > 0:
+        parts.append(f"[2:a]volume={sfx_delta}[sfx_delta]")
+        mix_inputs.append("[sfx_delta]")
+
+    if len(mix_inputs) == 1:
+        parts.append("[original]anull[mix]")
+    else:
+        joined = "".join(mix_inputs)
+        parts.append(
+            f"{joined}amix=inputs={len(mix_inputs)}:duration=first:normalize=0[mix]"
+        )
+
+    if limiter:
+        parts.append(f"[mix]alimiter=limit={limiter_level}[aout]")
+    else:
+        parts.append("[mix]anull[aout]")
+
+    return ";".join(parts)
+
+
 def mux_adjusted_audio(
         ffmpeg: str,
         input_path: Path,
@@ -1099,6 +1170,7 @@ def mux_adjusted_audio(
         sfx_path: Path,
         output_path: Path,
         *,
+        mode: str,
         speech_volume: float,
         sfx_volume: float,
         audio_codec: str,
@@ -1118,12 +1190,22 @@ def mux_adjusted_audio(
     if temp_output.exists():
         temp_output.unlink()
 
-    filter_complex = build_audio_filter(
-        speech_volume,
-        sfx_volume,
-        limiter,
-        limiter_level,
-    )
+    if mode == "remove_bgm":
+        filter_complex = build_remove_bgm_filter(
+            speech_volume,
+            sfx_volume,
+            limiter,
+            limiter_level,
+        )
+    elif mode == "no_bgm":
+        filter_complex = build_no_bgm_filter(
+            speech_volume,
+            sfx_volume,
+            limiter,
+            limiter_level,
+        )
+    else:
+        raise ValueError(f"未知 processing.mode：{mode}")
 
     command = [
         ffmpeg,
@@ -1142,7 +1224,6 @@ def mux_adjusted_audio(
     if audio_bitrate:
         command.extend(["-b:a", audio_bitrate])
 
-    # 若原檔有字幕則盡量一併保留；不支援的容器會由 FFmpeg 回報。
     command.extend([
         "-map", "0:s?",
         "-c:s", "copy",
@@ -1150,9 +1231,13 @@ def mux_adjusted_audio(
     ])
 
     print_header("Speech / SFX 音量調整與 Mux")
+    print_info(f"Mode：{mode}")
     print_info(f"Speech volume：{speech_volume:.2f}x")
     print_info(f"SFX volume：{sfx_volume:.2f}x")
-    print_info("BGM：0%（固定移除）")
+    if mode == "remove_bgm":
+        print_info("BGM：0%（固定移除）")
+    else:
+        print_info("BGM：原片應無 BGM；保留原始音訊並只疊加 stem 增益")
     print_info(f"Limiter：{'ON' if limiter else 'OFF'}")
 
     result = subprocess.run(command)
@@ -1179,19 +1264,28 @@ def process_video(config: dict[str, Any]) -> Path:
     validate_platform()
 
     input_path = validate_input(config["input"])
-    output_path = create_output_path(input_path, config.get("output"))
-
     eluate_cfg = config["eluate"]
     audio_cfg = config["audio"]
     processing_cfg = config["processing"]
+    mode = processing_cfg["mode"]
+
+    output_path = create_output_path(
+        input_path,
+        config.get("output"),
+        mode,
+    )
 
     print_info(f"輸入：{input_path}")
     print_info(f"輸出：{output_path}")
     print_info(f"Checkpoint：{eluate_cfg['checkpoint']}")
     print_info(f"Device：{eluate_cfg['device'] or 'auto'}")
+    print_info(f"Mode：{mode}")
     print_info(f"Speech：{audio_cfg['speech_volume']:.2f}x")
     print_info(f"SFX：{audio_cfg['sfx_volume']:.2f}x")
-    print_info("BGM：0%（固定移除）")
+    if mode == "remove_bgm":
+        print_info("BGM：0%（固定移除）")
+    else:
+        print_info("BGM：此模式假設原片沒有 BGM；原始音訊會保留")
 
     print_info("檢查 FFmpeg...")
     ffmpeg = check_ffmpeg()
@@ -1230,6 +1324,7 @@ def process_video(config: dict[str, Any]) -> Path:
             speech_path,
             sfx_path,
             output_path,
+            mode=mode,
             speech_volume=audio_cfg["speech_volume"],
             sfx_volume=audio_cfg["sfx_volume"],
             audio_codec=audio_cfg["codec"],
@@ -1248,9 +1343,15 @@ def process_video(config: dict[str, Any]) -> Path:
 
         print()
         print("音訊結果：")
-        print("  Music   → 移除")
-        print(f"  Speech  → {audio_cfg['speech_volume']:.2f}x")
-        print(f"  SFX     → {audio_cfg['sfx_volume']:.2f}x")
+        if mode == "remove_bgm":
+            print("  Music   → 移除")
+            print(f"  Speech  → {audio_cfg['speech_volume']:.2f}x")
+            print(f"  SFX     → {audio_cfg['sfx_volume']:.2f}x")
+        else:
+            print("  Original → 保留 1.00x")
+            print(f"  Speech   → 目標 {audio_cfg['speech_volume']:.2f}x")
+            print(f"  SFX      → 目標 {audio_cfg['sfx_volume']:.2f}x")
+            print("  Music    → 不做移除；此模式僅適合原片本來就沒有 BGM")
 
         if keep_stems:
             print_info(f"保留 stems：{work_dir}")
@@ -1269,8 +1370,8 @@ def process_video(config: dict[str, Any]) -> Path:
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "使用 ELUATE / BandIt v2 固定移除 BGM，"
-            "並分別調整 Speech / SFX 音量。"
+            "使用 ELUATE / BandIt v2 分離 Speech / SFX。"
+            "支援 remove_bgm 與 no_bgm 兩種模式。"
         )
     )
 
@@ -1303,6 +1404,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overwrite", action=argparse.BooleanOptionalAction, default=None,
         help="是否允許覆蓋既有輸出檔。",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["remove_bgm", "no_bgm"],
+        default=None,
+        help="處理模式：remove_bgm=移除 BGM；no_bgm=原片無 BGM，只增強 Speech/SFX。",
     )
     parser.add_argument(
         "--keep-stems", action=argparse.BooleanOptionalAction, default=None,

@@ -1,65 +1,81 @@
 # ============================================================
-# Video BGM Remover 設定檔
+# auto-adjust-bgm / Video Audio Mixer 設定檔
 # ============================================================
 
 # 輸入影片。
-# 相對路徑會以此 YAML 所在目錄為基準。
+# 相對路徑會以此 YAML 所在資料夾為基準。
 input: "TestVid.mp4"
 
 # 輸出影片。
-# null = 自動產生：<原檔名>_no_bgm.<副檔名>
+# null 時：
+#   remove_bgm -> <原檔名>_no_bgm.<副檔名>
+#   no_bgm     -> <原檔名>_audio_adjusted.<副檔名>
 output: null
 
 eluate:
   # BandIt v2 checkpoint。
   # 可用：multi / eng / deu / fra / spa / cmn / fao
-  # 日文、混合語言建議 multi。
   checkpoint: "multi"
 
-  # AI 運算裝置。
-  # null = ELUATE 自動選擇 CUDA > MPS > CPU
-  # WSL/Linux + NVIDIA：cuda
-  # Apple Silicon Mac：mps
-  # Intel Mac：通常 cpu
-  device: null
+  # 運算裝置。
+  # null = 自動偵測
+  # cuda = NVIDIA GPU（Linux / WSL2）
+  # mps  = Apple Silicon Metal
+  # cpu  = CPU
+  device: "cuda"
 
-  # true = 跳過 ELUATE 的影片長度與磁碟空間預檢查。
-  # 一般保持 false。
+  # 傳給 ELUATE 的 force。
+  # true 會略過部分影片長度 / 磁碟空間預檢查。
   force: false
 
 audio:
-  # Speech 音量倍率。
-  # 1.0 = 100%
-  # 1.2 = 120%
-  # 0.8 = 80%
-  # 允許範圍：0.0 ~ 2.0
+  # Speech 目標音量倍率。
+  # 1.0 = 維持原本
+  # 1.2 = 約增加 20%
+  # remove_bgm 模式允許 0.0 ~ 2.0
+  # no_bgm 模式目前要求 >= 1.0，因為此模式採「保留原音 + 疊加增益 stem」策略。
   speech_volume: 1.0
 
-  # SFX 音量倍率。
-  # 允許範圍：0.0 ~ 2.0
-  sfx_volume: 1.0
+  # SFX 目標音量倍率。
+  # 例：1.5 = 音效增強到約 150%
+  # no_bgm 模式若只是「人聲不變、音效放大」，推薦 speech=1.0 / sfx=1.3~1.6。
+  sfx_volume: 1.5
 
-  # 最終輸出影片的音訊 codec。
-  # 最通用建議：aac
+  # 最終影片音訊編碼。
   codec: "aac"
 
-  # 音訊 bitrate。
-  # AAC 建議 192k / 256k / 320k。
-  # null = 不額外傳 -b:a 給 FFmpeg。
+  # 最終音訊 bitrate；null 表示不手動指定。
   bitrate: "256k"
 
-  # Speech + SFX 相加後可能超過 0 dBFS。
-  # true = 使用 FFmpeg alimiter 防止明顯 clipping / 爆音。
+  # 混音後套 limiter，降低增益後 clipping / 爆音風險。
   limiter: true
 
-  # limiter 峰值上限，範圍 0.1 ~ 1.0。
-  # 0.95 = 峰值限制在約 95%。
+  # limiter 上限，0.1 ~ 1.0。
   limiter_level: 0.95
 
 processing:
-  # true = 輸出檔已存在時允許覆蓋。
+  # ----------------------------------------------------------
+  # 處理模式
+  # ----------------------------------------------------------
+  # remove_bgm:
+  #   適合原片有 BGM。
+  #   ELUATE 分離 Speech / SFX，Music 直接丟棄，再重建音訊。
+  #   缺點：若 ELUATE 把某些遊戲音效誤判為 Music，那些音效也可能被移除。
+  #
+  # no_bgm:
+  #   適合你已確定原片沒有 BGM，只想調整人聲 / 音效。
+  #   不用 Speech + SFX 重建整條音訊，而是保留原始音訊 1.0x，
+  #   再額外疊加需要增加的 Speech / SFX stem。
+  #
+  #   例：speech=1.0, sfx=1.5
+  #       output = original + (sfx * 0.5)
+  #
+  #   優點：即使某些 SFX 沒被 ELUATE 正確抓進 sfx stem，
+  #         它仍會留在 original 裡，不會像 remove_bgm 模式一樣被誤刪。
+  mode: "no_bgm"
+
+  # true = 允許覆蓋既有輸出檔。
   overwrite: true
 
-  # true = 保留 ELUATE 產生的 speech / sfx WAV。
-  # false = 處理完成後刪除暫存 stems。
+  # true = 保留 ELUATE 產生的 speech / sfx WAV，方便檢查模型分類結果。
   keep_stems: false
