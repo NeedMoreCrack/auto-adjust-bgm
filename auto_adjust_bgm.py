@@ -276,13 +276,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     processing["mode"] = mode
 
-    if mode == "no_bgm":
-        if audio["speech_volume"] < 1.0 or audio["sfx_volume"] < 1.0:
-            raise ValueError(
-                "processing.mode=no_bgm 採用『保留原音 + 疊加增益 stem』策略，"
-                "因此 speech_volume / sfx_volume 必須 >= 1.0。"
-            )
-
     if not isinstance(processing.get("overwrite", True), bool):
         raise ValueError("processing.overwrite 必須是 true / false。")
     if not isinstance(processing.get("keep_stems", False), bool):
@@ -1121,17 +1114,40 @@ def build_no_bgm_filter(
         limiter_level: float,
 ) -> str:
     """
-    no_bgm 模式不重建整條音訊，而是保留原音，再只疊加需要增加的 stem。
+    no_bgm 模式假設原始影片本身沒有 BGM。
 
-    例如：
+    為了盡量保留 ELUATE 沒有正確分類到 Speech / SFX stem 的聲音，
+    不直接用 Speech + SFX 重建整條音訊，而是以原始音訊為基底，
+    再使用 stem 的「差值」調整各類聲音：
+
+        output =
+            original
+            + speech * (speech_volume - 1.0)
+            + sfx    * (sfx_volume - 1.0)
+
+    例 1：
         speech_volume = 1.0
         sfx_volume = 1.5
 
-    實際為：
-        original + (sfx * 0.5)
+        output = original + sfx * 0.5
 
-    好處是即使 ELUATE 把某些 SFX 誤判成 Music / 未抓進 sfx stem，
-    原始音訊中的那些聲音仍會維持 1.0x，不會被誤刪。
+    例 2：
+        speech_volume = 0.5
+        sfx_volume = 2.0
+
+        output = original - speech * 0.5 + sfx * 1.0
+
+    因此 no_bgm 模式可支援 0.0 ~ 2.0：
+        0.0 = 嘗試完全扣除該 stem
+        0.5 = 約 50%
+        1.0 = 維持原始音量
+        1.5 = 約 150%
+        2.0 = 約 200%
+
+    注意：
+        當倍率低於 1.0 時，本質上是從原始音訊中反相扣除對應 stem。
+        如果 ELUATE 分離出的 stem 與原音不是完全一致，可能出現少量
+        相位抵銷、殘影或金屬感，這屬於 source separation 的限制。
     """
     speech_delta = speech_volume - 1.0
     sfx_delta = sfx_volume - 1.0
@@ -1139,12 +1155,18 @@ def build_no_bgm_filter(
     parts = ["[0:a]anull[original]"]
     mix_inputs = ["[original]"]
 
-    if speech_delta > 0:
-        parts.append(f"[1:a]volume={speech_delta}[speech_delta]")
+    # FFmpeg volume multiplier 可使用負值。
+    # 負值代表反相後混回，因此等價於從 original 中扣除該 stem。
+    if abs(speech_delta) > 1e-9:
+        parts.append(
+            f"[1:a]volume={speech_delta:.10f}[speech_delta]"
+        )
         mix_inputs.append("[speech_delta]")
 
-    if sfx_delta > 0:
-        parts.append(f"[2:a]volume={sfx_delta}[sfx_delta]")
+    if abs(sfx_delta) > 1e-9:
+        parts.append(
+            f"[2:a]volume={sfx_delta:.10f}[sfx_delta]"
+        )
         mix_inputs.append("[sfx_delta]")
 
     if len(mix_inputs) == 1:
@@ -1152,7 +1174,8 @@ def build_no_bgm_filter(
     else:
         joined = "".join(mix_inputs)
         parts.append(
-            f"{joined}amix=inputs={len(mix_inputs)}:duration=first:normalize=0[mix]"
+            f"{joined}amix=inputs={len(mix_inputs)}:"
+            "duration=first:normalize=0[mix]"
         )
 
     if limiter:
@@ -1282,6 +1305,15 @@ def process_video(config: dict[str, Any]) -> Path:
     print_info(f"Mode：{mode}")
     print_info(f"Speech：{audio_cfg['speech_volume']:.2f}x")
     print_info(f"SFX：{audio_cfg['sfx_volume']:.2f}x")
+
+    if mode == "no_bgm" and (
+            audio_cfg["speech_volume"] < 1.0
+            or audio_cfg["sfx_volume"] < 1.0
+    ):
+        print_warn(
+            "no_bgm 模式下倍率低於 1.0 會透過反相 stem 從原音扣除，"
+            "可能產生少量相位抵銷或分離 artifact。"
+        )
     if mode == "remove_bgm":
         print_info("BGM：0%（固定移除）")
     else:
@@ -1409,7 +1441,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=["remove_bgm", "no_bgm"],
         default=None,
-        help="處理模式：remove_bgm=移除 BGM；no_bgm=原片無 BGM，只增強 Speech/SFX。",
+        help="處理模式：remove_bgm=移除 BGM；no_bgm=原片無 BGM，可提高或降低 Speech/SFX。",
     )
     parser.add_argument(
         "--keep-stems", action=argparse.BooleanOptionalAction, default=None,
